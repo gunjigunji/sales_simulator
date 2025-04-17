@@ -1,0 +1,12 @@
+[project]
+name = "20250416-sales-simulator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jupyterlab>=4.4.0",
+    "openai>=1.74.0",
+    "pydantic>=2.11.3",
+    "python-dotenv>=1.1.0",
+]
