@@ -15,6 +15,7 @@ from src.models.persona import (
     MeetingLog,
     PersonalityTrait,
     ProductType,
+    ResponseType,
     SalesPersona,
     SalesProgress,
     SalesStatus,
@@ -131,12 +132,18 @@ class SimulationService:
         session_history = []
         current_visit_date = visit_date or datetime.now()
 
+        # 会話コンテキストの更新
+        company_persona.conversation_context.last_contact_date = current_visit_date
+        company_persona.conversation_context.cleanup_old_records(
+            retention_visits=self.config.memory_retention_visits
+        )
+
         if prev_history:
             prev_summary = f"""
             前回の訪問内容：
             {prev_history}
             ...
-            """  # （内容は変更なし）
+            """
             session_history.append(SessionHistory(role="system", content=prev_summary))
 
         # 初回と2回目以降でプロンプトを分岐
@@ -187,6 +194,18 @@ class SimulationService:
                             else "消極的"
                         )
 
+            # 会話コンテキストから前回の約束や話題を取得
+            previous_actions = (
+                "、".join(company_persona.conversation_context.promised_actions[-3:])
+                if company_persona.conversation_context.promised_actions
+                else "特になし"
+            )
+            previous_topics = (
+                "、".join(company_persona.conversation_context.discussed_topics[-3:])
+                if company_persona.conversation_context.discussed_topics
+                else "特になし"
+            )
+
             initial_greeting_prompt = f"""
             以下の情報に基づいて、営業担当者として企業担当者に送るメールを生成してください。
             メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
@@ -216,6 +235,8 @@ class SimulationService:
             前回のやり取りの状況：
             - 提案した商品：{", ".join([p.value for p in previous_products]) if previous_products else "なし"}
             - 企業様の反応：{previous_status if previous_status else "不明"}
+            - 前回の約束事項：{previous_actions}
+            - 前回の話題：{previous_topics}
 
             前回のやり取りを踏まえて、適切なフォローアップと新たな提案を行ってください。
             前回の提案に対する企業様の反応を考慮し、必要に応じて提案内容を調整してください。
@@ -230,14 +251,46 @@ class SimulationService:
             )
             initial_email.sender = sales_persona.name
             initial_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
+
+            # 興味度スコアの計算と応答タイプの決定
+            interest_score = company_persona.calculate_interest_score(
+                initial_email.body, initial_email.product_type, config=self.config
+            )
+            response_type = company_persona.determine_response_type(
+                interest_score, config=self.config
+            )
+
             session_history.append(
                 SessionHistory(
                     role="assistant",
                     content=initial_email.format_as_email(),
                     product_type=initial_email.product_type,
-                    success_score=initial_email.success_score,
+                    success_score=interest_score.score
+                    / 100.0,  # 0-100スケールを0-1に変換
                 )
             )
+
+            # 提案内容の分析と会話コンテキストの更新
+            if initial_email.product_type:
+                company_persona.conversation_context.add_product_discussion(
+                    initial_email.product_type
+                )
+
+            # メール内容から話題を抽出（簡易的な実装）
+            topics = ["ご挨拶", "自己紹介"] if session_num == 1 else []
+            if "ご提案" in initial_email.body:
+                topics.append("商品提案")
+            if "資料" in initial_email.body:
+                topics.append("資料送付")
+            for topic in topics:
+                company_persona.conversation_context.add_topic(topic)
+
+            # 約束事項の抽出（簡易的な実装）
+            if "ご検討" in initial_email.body:
+                company_persona.conversation_context.add_action("商品内容の検討")
+            if "ご連絡" in initial_email.body:
+                company_persona.conversation_context.add_action("追加連絡")
+
         except Exception as e:
             print(f"Error generating initial email: {e}")
             # エラー時はデフォルトのメールを使用
@@ -327,6 +380,10 @@ class SimulationService:
 
                 会話履歴：
                 {[h.content for h in session_history]}
+
+                前回の企業様の反応：
+                - 興味レベル：{company_persona.current_interest_score.level.value if company_persona.current_interest_score else "不明"}
+                - 応答タイプ：{company_persona.response_history[-1].value if company_persona.response_history else "不明"}
                 """
 
                 try:
@@ -338,52 +395,16 @@ class SimulationService:
                     sales_email.sender = sales_persona.name
                     sales_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
 
-                    # 提案内容の分析
-                    analysis_messages = [
-                        {
-                            "role": "system",
-                            "content": """
-                            以下の営業提案を分析し、企業の反応を予測してください。
-                            分析結果は必ず指定されたJSONスキーマに準拠した形式で返してください。
-                            """,
-                        },
-                        {
-                            "role": "user",
-                            "content": f"""
-                            提案内容：
-                            {sales_email.body}
-
-                            企業情報：
-                            {company_persona.model_dump_json()}
-
-                            企業担当者情報：
-                            {company_persona.contact_person.model_dump_json()}
-
-                            前回のやり取り：
-                            {[h.content for h in session_history]}
-
-                            前回のやり取りを踏まえて、以下の点を分析してください：
-                            - 今回の提案が前回のやり取りとどのように関連しているか
-                            - 企業の反応が前回のやり取りからどのように変化しているか
-                            - 提案の進捗状況と今後の見通し
-                            """,
-                        },
-                    ]
-
-                    analysis_data = self.openai_client.call_structured_api(
-                        analysis_messages,
-                        response_model=ProposalAnalysis,
-                        temperature=0.3,
+                    # 興味度スコアの計算
+                    interest_score = company_persona.calculate_interest_score(
+                        sales_email.body, sales_email.product_type, config=self.config
                     )
-
-                    sales_email.product_type = analysis_data.product_type
-                    sales_email.success_score = (
-                        analysis_data.success_score
-                        * sales_persona.calculate_success_rate()
+                    response_type = company_persona.determine_response_type(
+                        interest_score, config=self.config
                     )
 
                     # 成功した提案は記録
-                    if sales_email.success_score >= self.config.min_success_score:
+                    if interest_score.score >= (self.config.min_success_score * 100):
                         matched_products.append(sales_email.product_type)
 
                     session_history.append(
@@ -391,11 +412,36 @@ class SimulationService:
                             role="assistant",
                             content=sales_email.format_as_email(),
                             product_type=sales_email.product_type,
-                            success_score=sales_email.success_score,
+                            success_score=interest_score.score / 100.0,
                         )
                     )
 
-                    attempts += 1  # メール送信後にカウントアップ
+                    # 提案内容の分析と会話コンテキストの更新
+                    if sales_email.product_type:
+                        company_persona.conversation_context.add_product_discussion(
+                            sales_email.product_type
+                        )
+
+                    # メール内容から話題を抽出（簡易的な実装）
+                    topics = []
+                    if "ご提案" in sales_email.body:
+                        topics.append("商品提案")
+                    if "資料" in sales_email.body:
+                        topics.append("資料送付")
+                    if "シミュレーション" in sales_email.body:
+                        topics.append("シミュレーション")
+                    for topic in topics:
+                        company_persona.conversation_context.add_topic(topic)
+
+                    # 約束事項の抽出（簡易的な実装）
+                    if "ご検討" in sales_email.body:
+                        company_persona.conversation_context.add_action(
+                            "商品内容の検討"
+                        )
+                    if "ご連絡" in sales_email.body:
+                        company_persona.conversation_context.add_action("追加連絡")
+
+                    attempts += 1
 
                 except Exception as e:
                     print(f"Error generating sales email: {e}")
@@ -404,6 +450,19 @@ class SimulationService:
                 current_role = "customer"
             else:
                 # 企業担当者からのメールを生成
+                # 直前の応答タイプに基づいて、適切な返信を生成
+                response_type = (
+                    company_persona.response_history[-1]
+                    if company_persona.response_history
+                    else ResponseType.NEUTRAL
+                )
+
+                if response_type == ResponseType.REJECTION:
+                    rejection_reason = company_persona.select_rejection_reason()
+                    rejection_context = f"拒否理由: {rejection_reason.value}"
+                else:
+                    rejection_context = ""
+
                 customer_email_prompt = f"""
                 以下の情報に基づいて、企業担当者として営業担当者に送るメールを生成してください。
                 メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
@@ -436,6 +495,11 @@ class SimulationService:
                 - 経験年数：{sales_persona.experience_level.value}
                 - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
 
+                現在の状況：
+                - 応答タイプ：{response_type.value}
+                - 興味レベル：{company_persona.current_interest_score.level.value if company_persona.current_interest_score else "不明"}
+                {rejection_context}
+
                 会話履歴：
                 {[h.content for h in session_history]}
 
@@ -461,7 +525,7 @@ class SimulationService:
                             content=customer_email.format_as_email(),
                         )
                     )
-                    attempts += 1  # メール送信後にカウントアップ
+                    attempts += 1
 
                 except Exception as e:
                     print(f"Error generating customer email: {e}")
@@ -485,19 +549,20 @@ class SimulationService:
                             content=default_customer_email.format_as_email(),
                         )
                     )
-                    attempts += 1  # デフォルトメール送信後もカウントアップ
+                    attempts += 1
 
                 current_role = "sales"
 
+                # 応答タイプに基づいてステータスを更新
+                if response_type == ResponseType.ACCEPTANCE:
+                    current_status = SalesStatus.SUCCESS
+                elif response_type == ResponseType.REJECTION:
+                    current_status = SalesStatus.FAILED
+                elif attempts >= self.config.num_turns_per_visit:
+                    current_status = SalesStatus.PENDING
+
         # 会話終了後に最終的なステータスを判定
-        final_status = SalesStatus.PENDING
-        if matched_products:
-            final_status = SalesStatus.SUCCESS
-        elif any(
-            h.success_score is not None and h.success_score < 0.4
-            for h in session_history
-        ):
-            final_status = SalesStatus.FAILED
+        final_status = current_status
 
         history_dicts = [h.to_dict() for h in session_history]
 

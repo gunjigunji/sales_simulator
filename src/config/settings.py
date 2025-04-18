@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
 
@@ -21,6 +21,34 @@ class SimulationConfig:
     max_tokens: int = 3000
     min_success_score: float = 0.7  # 成功判定の閾値を0.6から0.7に引き上げ
     max_attempts_per_visit: int = 4
+
+    # 新しい設定パラメータ
+    interest_score_thresholds: Dict[str, float] = field(
+        default_factory=lambda: {
+            "very_high": 80.0,  # VERY_HIGH判定の閾値
+            "high": 60.0,  # HIGH判定の閾値
+            "moderate": 40.0,  # MODERATE判定の閾値
+            "low": 20.0,  # LOW判定の閾値
+        }
+    )
+
+    response_type_thresholds: Dict[str, float] = field(
+        default_factory=lambda: {
+            "acceptance": 80.0,  # 提案受諾の閾値
+            "positive": 60.0,  # 前向きな返信の閾値
+            "question": 40.0,  # 追加質問の閾値
+            "neutral": 20.0,  # 中立的な返信の閾値
+        }
+    )
+
+    keyword_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "positive": 5.0,  # ポジティブキーワードのスコア加算値
+            "negative": -5.0,  # ネガティブキーワードのスコア減算値
+        }
+    )
+
+    memory_retention_visits: int = 3  # 何回前の訪問まで記憶として保持するか
 
 
 @dataclass
