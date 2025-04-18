@@ -267,13 +267,13 @@ class SimulationService:
             )
 
         current_role = "customer"
-        attempts = 0
+        attempts = 1  # 初回メールを1回目としてカウント
         matched_products = []
-        final_status = SalesStatus.IN_PROGRESS
+        current_status = SalesStatus.IN_PROGRESS
 
         while (
-            attempts < self.config.max_attempts_per_visit
-            and final_status == SalesStatus.IN_PROGRESS
+            attempts <= self.config.num_turns_per_visit  # 初回メールを含めた合計回数
+            and current_status == SalesStatus.IN_PROGRESS
         ):
             if current_role == "sales":
                 # 営業担当者からのメールを生成
@@ -347,6 +347,10 @@ class SimulationService:
                         * sales_persona.calculate_success_rate()
                     )
 
+                    # 成功した提案は記録
+                    if sales_email.success_score >= self.config.min_success_score:
+                        matched_products.append(sales_email.product_type)
+
                     session_history.append(
                         SessionHistory(
                             role="assistant",
@@ -356,19 +360,10 @@ class SimulationService:
                         )
                     )
 
-                    if sales_email.success_score >= self.config.min_success_score:
-                        matched_products.append(sales_email.product_type)
-                        final_status = SalesStatus.SUCCESS
-                    elif sales_email.success_score < 0.4:
-                        final_status = SalesStatus.FAILED
-                    else:
-                        final_status = SalesStatus.PENDING
-
-                    attempts += 1
+                    attempts += 1  # メール送信後にカウントアップ
 
                 except Exception as e:
                     print(f"Error generating sales email: {e}")
-                    final_status = SalesStatus.PENDING
                     attempts += 1
 
                 current_role = "customer"
@@ -417,6 +412,8 @@ class SimulationService:
                             content=customer_email.format_as_email(),
                         )
                     )
+                    attempts += 1  # メール送信後にカウントアップ
+
                 except Exception as e:
                     print(f"Error generating customer email: {e}")
                     # エラー時はデフォルトのメールを使用
@@ -439,8 +436,19 @@ class SimulationService:
                             content=default_customer_email.format_as_email(),
                         )
                     )
+                    attempts += 1  # デフォルトメール送信後もカウントアップ
 
                 current_role = "sales"
+
+        # 会話終了後に最終的なステータスを判定
+        final_status = SalesStatus.PENDING
+        if matched_products:
+            final_status = SalesStatus.SUCCESS
+        elif any(
+            h.success_score is not None and h.success_score < 0.4
+            for h in session_history
+        ):
+            final_status = SalesStatus.FAILED
 
         history_dicts = [h.to_dict() for h in session_history]
 
@@ -542,8 +550,7 @@ class SimulationService:
             )
             meeting_logs.append(meeting_log)
 
-            # 進捗状況を更新（ただし、SUCCESSやFAILEDでも次の訪問を継続）
-            progress.status = session_summary.final_status
+            # 進捗状況を更新（成功した商品と訪問回数のみ）
             progress.matched_products.extend(session_summary.matched_products)
             progress.current_visit = visit
 

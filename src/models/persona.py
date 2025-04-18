@@ -62,7 +62,7 @@ class SalesAttempt(BaseModel):
 
 
 class SalesProgress(BaseModel):
-    status: SalesStatus = SalesStatus.INITIAL
+    status: SalesStatus = SalesStatus.IN_PROGRESS
     current_visit: int = 1
     attempts: List[SalesAttempt] = Field(default_factory=list)
     total_score: float = 0.0
