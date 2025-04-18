@@ -5,16 +5,18 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from pydantic import BaseModel, Field, ValidationError
 
-from src.config.settings import BankMetadata, Prompts, SimulationConfig
 from src.models.persona import (
     Assignment,
     CompanyPersona,
     CustomerPersonalityTrait,
     EmailMessage,
+    EvaluationCriteria,
     ExperienceLevel,
     MeetingLog,
+    NegotiationStage,
     PersonalityTrait,
     ProductType,
+    Proposal,
     ResponseType,
     SalesPersona,
     SalesProgress,
@@ -24,6 +26,7 @@ from src.models.persona import (
     SimulationResult,
 )
 from src.models.proposal_analysis import ProposalAnalysis
+from src.models.settings import BankMetadata, Prompts, SimulationConfig
 from src.services.openai_client import OpenAIClient
 
 
@@ -146,6 +149,29 @@ class SimulationService:
             """
             session_history.append(SessionHistory(role="system", content=prev_summary))
 
+        # 商談進捗の更新
+        if session_num == 1:
+            company_persona.negotiation_progress.update_stage(NegotiationStage.INITIAL)
+        elif company_persona.negotiation_progress.stage == NegotiationStage.INITIAL:
+            company_persona.negotiation_progress.update_stage(
+                NegotiationStage.INFORMATION_GATHERING
+            )
+        elif len(company_persona.negotiation_progress.required_information) == 0:
+            if (
+                company_persona.negotiation_progress.stage
+                == NegotiationStage.INFORMATION_GATHERING
+            ):
+                company_persona.negotiation_progress.update_stage(
+                    NegotiationStage.DETAILED_REVIEW
+                )
+            elif (
+                company_persona.negotiation_progress.stage
+                == NegotiationStage.DETAILED_REVIEW
+            ):
+                company_persona.negotiation_progress.update_stage(
+                    NegotiationStage.FINAL_EVALUATION
+                )
+
         # 初回と2回目以降でプロンプトを分岐
         if session_num == 1:
             initial_greeting_prompt = f"""
@@ -172,6 +198,8 @@ class SimulationService:
             - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
             - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
 
+            商談段階：{company_persona.negotiation_progress.stage.value}
+            
             営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
 
             初回のメールであることを考慮し、適切な挨拶と自己紹介を含めてください。
@@ -206,6 +234,19 @@ class SimulationService:
                 else "特になし"
             )
 
+            # 商談進捗情報を取得
+            current_stage = company_persona.negotiation_progress.stage.value
+            key_concerns = (
+                ", ".join(company_persona.negotiation_progress.key_concerns)
+                if company_persona.negotiation_progress.key_concerns
+                else "特になし"
+            )
+            required_info = (
+                ", ".join(company_persona.negotiation_progress.required_information)
+                if company_persona.negotiation_progress.required_information
+                else "特になし"
+            )
+
             initial_greeting_prompt = f"""
             以下の情報に基づいて、営業担当者として企業担当者に送るメールを生成してください。
             メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
@@ -230,13 +271,15 @@ class SimulationService:
             - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
             - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
 
-            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
-
-            前回のやり取りの状況：
-            - 提案した商品：{", ".join([p.value for p in previous_products]) if previous_products else "なし"}
-            - 企業様の反応：{previous_status if previous_status else "不明"}
+            商談進捗情報：
+            - 現在の段階：{current_stage}
+            - 主な懸念事項：{key_concerns}
+            - 必要な追加情報：{required_info}
             - 前回の約束事項：{previous_actions}
             - 前回の話題：{previous_topics}
+            - 提案商品の反応：{previous_status if previous_status else "不明"}
+
+            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
 
             前回のやり取りを踏まえて、適切なフォローアップと新たな提案を行ってください。
             前回の提案に対する企業様の反応を考慮し、必要に応じて提案内容を調整してください。
@@ -252,21 +295,38 @@ class SimulationService:
             initial_email.sender = sales_persona.name
             initial_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
 
-            # 興味度スコアの計算と応答タイプの決定
-            interest_score = company_persona.calculate_interest_score(
-                initial_email.body, initial_email.product_type, config=self.config
+            # 提案内容の構造化
+            proposal = Proposal(
+                product_type=initial_email.product_type or ProductType.OTHER,
+                terms={},
+                benefits=[],
+                risks=[],
+                cost_information={},
+                support_details={},
+                track_record=[],
             )
-            response_type = company_persona.determine_response_type(
-                interest_score, config=self.config
-            )
+
+            # 提案内容の評価
+            evaluation = company_persona.evaluate_proposal(proposal)
+
+            # 評価結果に基づく応答タイプの決定
+            if evaluation.decision == "success":
+                response_type = ResponseType.ACCEPTANCE
+            elif evaluation.decision == "failed":
+                response_type = ResponseType.REJECTION
+            else:
+                response_type = company_persona.determine_response_type(
+                    company_persona.current_interest_score, config=self.config
+                )
 
             session_history.append(
                 SessionHistory(
                     role="assistant",
                     content=initial_email.format_as_email(),
                     product_type=initial_email.product_type,
-                    success_score=interest_score.score
-                    / 100.0,  # 0-100スケールを0-1に変換
+                    success_score=evaluation.scores.get(
+                        EvaluationCriteria.BENEFIT.value, 0.5
+                    ),
                 )
             )
 
@@ -276,7 +336,7 @@ class SimulationService:
                     initial_email.product_type
                 )
 
-            # メール内容から話題を抽出（簡易的な実装）
+            # メール内容から話題を抽出
             topics = ["ご挨拶", "自己紹介"] if session_num == 1 else []
             if "ご提案" in initial_email.body:
                 topics.append("商品提案")
@@ -285,11 +345,21 @@ class SimulationService:
             for topic in topics:
                 company_persona.conversation_context.add_topic(topic)
 
-            # 約束事項の抽出（簡易的な実装）
+            # 約束事項の抽出
             if "ご検討" in initial_email.body:
                 company_persona.conversation_context.add_action("商品内容の検討")
             if "ご連絡" in initial_email.body:
                 company_persona.conversation_context.add_action("追加連絡")
+
+            # 評価結果に基づく懸念事項の更新
+            for concern in evaluation.concerns:
+                company_persona.negotiation_progress.add_concern(concern)
+
+            # 必要な追加情報の更新
+            if evaluation.required_info:
+                company_persona.negotiation_progress.required_information = (
+                    evaluation.required_info
+                )
 
         except Exception as e:
             print(f"Error generating initial email: {e}")
@@ -378,6 +448,11 @@ class SimulationService:
                 - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
                 - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
 
+                商談進捗情報：
+                - 現在の段階：{company_persona.negotiation_progress.stage.value}
+                - 主な懸念事項：{", ".join(company_persona.negotiation_progress.key_concerns) if company_persona.negotiation_progress.key_concerns else "特になし"}
+                - 必要な追加情報：{", ".join(company_persona.negotiation_progress.required_information) if company_persona.negotiation_progress.required_information else "特になし"}
+
                 会話履歴：
                 {[h.content for h in session_history]}
 
@@ -395,16 +470,21 @@ class SimulationService:
                     sales_email.sender = sales_persona.name
                     sales_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
 
-                    # 興味度スコアの計算
-                    interest_score = company_persona.calculate_interest_score(
-                        sales_email.body, sales_email.product_type, config=self.config
-                    )
-                    response_type = company_persona.determine_response_type(
-                        interest_score, config=self.config
+                    # 提案内容の構造化と評価
+                    proposal = Proposal(
+                        product_type=sales_email.product_type or ProductType.OTHER,
+                        terms={},
+                        benefits=[],
+                        risks=[],
+                        cost_information={},
+                        support_details={},
+                        track_record=[],
                     )
 
+                    evaluation = company_persona.evaluate_proposal(proposal)
+
                     # 成功した提案は記録
-                    if interest_score.score >= (self.config.min_success_score * 100):
+                    if evaluation.decision == "success":
                         matched_products.append(sales_email.product_type)
 
                     session_history.append(
@@ -412,7 +492,9 @@ class SimulationService:
                             role="assistant",
                             content=sales_email.format_as_email(),
                             product_type=sales_email.product_type,
-                            success_score=interest_score.score / 100.0,
+                            success_score=evaluation.scores.get(
+                                EvaluationCriteria.BENEFIT.value, 0.5
+                            ),
                         )
                     )
 
@@ -422,7 +504,7 @@ class SimulationService:
                             sales_email.product_type
                         )
 
-                    # メール内容から話題を抽出（簡易的な実装）
+                    # メール内容から話題を抽出
                     topics = []
                     if "ご提案" in sales_email.body:
                         topics.append("商品提案")
@@ -433,13 +515,23 @@ class SimulationService:
                     for topic in topics:
                         company_persona.conversation_context.add_topic(topic)
 
-                    # 約束事項の抽出（簡易的な実装）
+                    # 約束事項の抽出
                     if "ご検討" in sales_email.body:
                         company_persona.conversation_context.add_action(
                             "商品内容の検討"
                         )
                     if "ご連絡" in sales_email.body:
                         company_persona.conversation_context.add_action("追加連絡")
+
+                    # 評価結果に基づく懸念事項の更新
+                    for concern in evaluation.concerns:
+                        company_persona.negotiation_progress.add_concern(concern)
+
+                    # 必要な追加情報の更新
+                    if evaluation.required_info:
+                        company_persona.negotiation_progress.required_information = (
+                            evaluation.required_info
+                        )
 
                     attempts += 1
 
@@ -494,6 +586,11 @@ class SimulationService:
                 - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
                 - 経験年数：{sales_persona.experience_level.value}
                 - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
+
+                商談進捗情報：
+                - 現在の段階：{company_persona.negotiation_progress.stage.value}
+                - 主な懸念事項：{", ".join(company_persona.negotiation_progress.key_concerns) if company_persona.negotiation_progress.key_concerns else "特になし"}
+                - 必要な追加情報：{", ".join(company_persona.negotiation_progress.required_information) if company_persona.negotiation_progress.required_information else "特になし"}
 
                 現在の状況：
                 - 応答タイプ：{response_type.value}

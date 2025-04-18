@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime
 
-from src.config.settings import (
+from src.config.defaults import (
     DEFAULT_BANK_METADATA,
     DEFAULT_PROMPTS,
     DEFAULT_SIMULATION_CONFIG,

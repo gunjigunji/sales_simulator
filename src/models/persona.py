@@ -1,11 +1,11 @@
 import random
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
-from src.config.settings import SimulationConfig  # 追加: 設定ファイルのインポート
+from src.models.settings import SimulationConfig  # 設定ファイルのインポート
 
 
 class SalesStatus(str, Enum):
@@ -99,7 +99,21 @@ class InterestScore(BaseModel):
     product_type: Optional[ProductType] = None  # 対象商品タイプ
     level: InterestLevel  # 興味レベル
     factors: Dict[str, float] = Field(default_factory=dict)  # スコアに影響を与えた要因
-    timestamp: datetime = Field(default_factory=datetime.now)  # 評価時刻
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat()
+    )  # 評価時刻をstr型で保存
+
+    @classmethod
+    def model_validate(cls, value, **kwargs):
+        if isinstance(value, dict) and (
+            "timestamp" not in value or not value["timestamp"]
+        ):
+            value["timestamp"] = datetime.now().isoformat()
+        return super().model_validate(value, **kwargs)
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+        arbitrary_types_allowed = True
 
     def calculate_level(self) -> InterestLevel:
         """スコアから興味レベルを計算"""
@@ -118,16 +132,27 @@ class InterestScore(BaseModel):
 class ConversationContext(BaseModel):
     """会話コンテキスト管理モデル"""
 
-    last_contact_date: Optional[datetime] = None  # 最終接触日
-    discussed_topics: List[str] = Field(default_factory=list)  # 話題履歴
-    promised_actions: List[str] = Field(default_factory=list)  # 約束した行動
-    interest_history: List[InterestScore] = Field(default_factory=list)  # 興味度履歴
-    rejection_history: List[RejectionReason] = Field(
-        default_factory=list
-    )  # 拒否理由履歴
-    product_discussions: Dict[ProductType, List[datetime]] = Field(
+    last_contact_date: Optional[str] = None  # 最終接触日をstr型で保存
+    discussed_topics: List[str] = Field(default_factory=list)
+    promised_actions: List[str] = Field(default_factory=list)
+    interest_history: List[InterestScore] = Field(default_factory=list)
+    rejection_history: List[RejectionReason] = Field(default_factory=list)
+    product_discussions: Dict[ProductType, List[str]] = Field(
         default_factory=dict
-    )  # 商品別議論履歴
+    )  # 日時をstr型で保存
+
+    @classmethod
+    def model_validate(cls, value, **kwargs):
+        if isinstance(value, dict):
+            if "last_contact_date" not in value or not value["last_contact_date"]:
+                value["last_contact_date"] = datetime.now().isoformat()
+            if "product_discussions" in value:
+                for product_type in value["product_discussions"]:
+                    value["product_discussions"][product_type] = [
+                        d.isoformat() if isinstance(d, datetime) else d
+                        for d in value["product_discussions"][product_type]
+                    ]
+        return super().model_validate(value, **kwargs)
 
     def cleanup_old_records(self, retention_visits: int = 3):
         """古い記録を削除"""
@@ -135,9 +160,7 @@ class ConversationContext(BaseModel):
             self.interest_history = self.interest_history[-retention_visits:]
         if len(self.rejection_history) > retention_visits:
             self.rejection_history = self.rejection_history[-retention_visits:]
-        if (
-            len(self.discussed_topics) > retention_visits * 2
-        ):  # 1回の訪問で複数の話題がある可能性を考慮
+        if len(self.discussed_topics) > retention_visits * 2:
             self.discussed_topics = self.discussed_topics[-(retention_visits * 2) :]
         if len(self.promised_actions) > retention_visits * 2:
             self.promised_actions = self.promised_actions[-(retention_visits * 2) :]
@@ -147,9 +170,10 @@ class ConversationContext(BaseModel):
         for product_type in self.product_discussions:
             # retention_visits * 30日より古い記録を削除
             self.product_discussions[product_type] = [
-                date
-                for date in self.product_discussions[product_type]
-                if (current_time - date).days <= retention_visits * 30
+                date_str
+                for date_str in self.product_discussions[product_type]
+                if (current_time - datetime.fromisoformat(date_str)).days
+                <= retention_visits * 30
             ]
 
     def add_topic(self, topic: str):
@@ -166,7 +190,7 @@ class ConversationContext(BaseModel):
         """商品の議論を記録"""
         if product_type not in self.product_discussions:
             self.product_discussions[product_type] = []
-        self.product_discussions[product_type].append(datetime.now())
+        self.product_discussions[product_type].append(datetime.now().isoformat())
 
     def get_recent_topics(self, limit: int = 3) -> List[str]:
         """最近の話題を取得"""
@@ -186,8 +210,8 @@ class ConversationContext(BaseModel):
         current_time = datetime.now()
         return sum(
             1
-            for date in self.product_discussions[product_type]
-            if (current_time - date).days <= days
+            for date_str in self.product_discussions[product_type]
+            if (current_time - datetime.fromisoformat(date_str)).days <= days
         )
 
 
@@ -339,6 +363,146 @@ class CompanyContactPersona(BaseModel):
         return style
 
 
+class NegotiationStage(str, Enum):
+    """商談の段階を表す列挙型"""
+
+    INITIAL = "initial"  # 初期検討段階
+    INFORMATION_GATHERING = "information_gathering"  # 情報収集段階
+    DETAILED_REVIEW = "detailed_review"  # 詳細検討段階
+    FINAL_EVALUATION = "final_evaluation"  # 最終評価段階
+    DECISION_MAKING = "decision_making"  # 意思決定段階
+
+
+class EvaluationCriteria(str, Enum):
+    """評価基準を表す列挙型"""
+
+    COST = "cost"  # コスト面
+    RISK = "risk"  # リスク面
+    BENEFIT = "benefit"  # メリット面
+    FEASIBILITY = "feasibility"  # 実現可能性
+    SUPPORT = "support"  # サポート体制
+    TRACK_RECORD = "track_record"  # 実績
+
+
+class NegotiationProgress(BaseModel):
+    """商談進捗管理モデル"""
+
+    stage: NegotiationStage = Field(default=NegotiationStage.INITIAL)
+    key_concerns: List[str] = Field(default_factory=list)
+    decision_criteria: List[str] = Field(default_factory=list)
+    required_information: List[str] = Field(default_factory=list)
+    evaluation_points: Dict[str, float] = Field(default_factory=dict)
+    last_updated: str = Field(
+        default_factory=lambda: datetime.now().isoformat()
+    )  # datetimeの代わりにstrを使用
+
+    def update_stage(self, new_stage: NegotiationStage):
+        """商談段階を更新"""
+        self.stage = new_stage
+        self.last_updated = datetime.now().isoformat()
+
+    def add_concern(self, concern: str):
+        """懸念事項を追加"""
+        if concern not in self.key_concerns:
+            self.key_concerns.append(concern)
+
+    def remove_concern(self, concern: str):
+        """解決された懸念事項を削除"""
+        if concern in self.key_concerns:
+            self.key_concerns.remove(concern)
+
+    def update_evaluation(self, criteria: str, score: float):
+        """評価スコアを更新"""
+        self.evaluation_points[criteria] = score
+
+    @property
+    def last_updated_datetime(self) -> datetime:
+        """last_updatedをdatetime型で取得"""
+        return datetime.fromisoformat(self.last_updated)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "stage": "initial",
+                "key_concerns": [],
+                "decision_criteria": [],
+                "required_information": [],
+                "evaluation_points": {},
+                "last_updated": datetime.now().isoformat(),
+            }
+        }
+
+
+class DecisionMaking(BaseModel):
+    """意思決定モデル"""
+
+    criteria_met: Dict[str, bool] = Field(default_factory=dict)
+    remaining_concerns: List[str] = Field(default_factory=list)
+    decision_factors: List[str] = Field(default_factory=list)
+    final_decision: Optional[str] = None
+    decision_reason: Optional[str] = None
+    decision_date: Optional[str] = None  # datetimeの代わりにstrを使用
+
+    def record_decision(self, decision: str, reason: str):
+        """最終判断を記録"""
+        self.final_decision = decision
+        self.decision_reason = reason
+        self.decision_date = datetime.now().isoformat()
+
+    @property
+    def decision_date_datetime(self) -> Optional[datetime]:
+        """decision_dateをdatetime型で取得"""
+        return (
+            datetime.fromisoformat(self.decision_date) if self.decision_date else None
+        )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "criteria_met": {},
+                "remaining_concerns": [],
+                "decision_factors": [],
+                "final_decision": None,
+                "decision_reason": None,
+                "decision_date": datetime.now().isoformat(),
+            }
+        }
+
+
+class EvaluationResult(BaseModel):
+    """提案評価結果モデル"""
+
+    decision: str
+    scores: Dict[str, float]
+    concerns: List[str]
+    required_info: Optional[List[str]] = None
+    evaluation_date: datetime = Field(default_factory=datetime.now)
+
+    @classmethod
+    def model_validate(cls, value, **kwargs):
+        if isinstance(value, dict) and (
+            "evaluation_date" not in value or not value["evaluation_date"]
+        ):
+            value["evaluation_date"] = datetime.now().isoformat()
+        return super().model_validate(value, **kwargs)
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+        arbitrary_types_allowed = True
+
+
+class Proposal(BaseModel):
+    """提案内容モデル"""
+
+    product_type: ProductType
+    terms: Dict[str, Any]
+    benefits: List[str]
+    risks: List[str]
+    cost_information: Dict[str, Any]
+    support_details: Dict[str, Any]
+    track_record: List[Dict[str, Any]]
+
+
 class CompanyPersona(BasePersona):
     name: str
     location: str
@@ -350,11 +514,11 @@ class CompanyPersona(BasePersona):
     future_plans: str
     banking_relationships: str
     financial_needs: str
-    content: str  # 元のテキスト形式の内容を保持
+    content: str
     personality_traits: List[CustomerPersonalityTrait]
-    decision_making_style: str  # 意思決定スタイル
-    risk_tolerance: float = Field(ge=0.0, le=1.0)  # リスク許容度
-    financial_literacy: float = Field(ge=0.0, le=1.0)  # 金融リテラシー
+    decision_making_style: str
+    risk_tolerance: float = Field(ge=0.0, le=1.0)
+    financial_literacy: float = Field(ge=0.0, le=1.0)
     interest_products: Dict[ProductType, float] = Field(
         default_factory=lambda: {
             ProductType.LOAN: 0.5,
@@ -364,17 +528,108 @@ class CompanyPersona(BasePersona):
             ProductType.OTHER: 0.5,
         }
     )
-    contact_person: Optional[CompanyContactPersona] = None  # 企業担当者を追加
+    contact_person: Optional[CompanyContactPersona] = None
 
-    # 新しいフィールドを追加
     conversation_context: ConversationContext = Field(
         default_factory=ConversationContext
-    )  # 会話コンテキスト
-    current_interest_score: Optional[InterestScore] = None  # 現在の興味度スコア
-    rejection_reasons: List[RejectionReason] = Field(
-        default_factory=list
-    )  # 拒否理由履歴
-    response_history: List[ResponseType] = Field(default_factory=list)  # 応答タイプ履歴
+    )
+    current_interest_score: InterestScore = Field(
+        default_factory=lambda: InterestScore(
+            score=50.0,
+            level=InterestLevel.MODERATE,
+            factors={},
+            timestamp=datetime.now().isoformat(),
+        )
+    )
+    rejection_reasons: List[RejectionReason] = Field(default_factory=list)
+    response_history: List[ResponseType] = Field(default_factory=list)
+    negotiation_progress: NegotiationProgress = Field(
+        default_factory=lambda: NegotiationProgress(
+            stage=NegotiationStage.INITIAL,
+            key_concerns=[],
+            decision_criteria=[],
+            required_information=[],
+            evaluation_points={},
+            last_updated=datetime.now().isoformat(),
+        )
+    )
+    decision_making: DecisionMaking = Field(default_factory=DecisionMaking)
+
+    @classmethod
+    def model_validate(cls, value, **kwargs):
+        if isinstance(value, dict):
+            # current_interest_scoreのデフォルト値を設定
+            if (
+                "current_interest_score" not in value
+                or not value["current_interest_score"]
+            ):
+                value["current_interest_score"] = InterestScore(
+                    score=50.0,
+                    level=InterestLevel.MODERATE,
+                    factors={},
+                    timestamp=datetime.now().isoformat(),
+                ).model_dump()
+            # negotiation_progressのデフォルト値を設定
+            if "negotiation_progress" not in value:
+                value["negotiation_progress"] = NegotiationProgress().model_dump()
+            elif isinstance(value["negotiation_progress"], dict):
+                # 既存のnegotiation_progressを補完
+                default_progress = NegotiationProgress().model_dump()
+                for key, default_value in default_progress.items():
+                    if (
+                        key not in value["negotiation_progress"]
+                        or not value["negotiation_progress"][key]
+                    ):
+                        value["negotiation_progress"][key] = default_value
+            # conversation_contextのデフォルト値を設定
+            if "conversation_context" not in value:
+                value["conversation_context"] = ConversationContext().model_dump()
+            # interest_productsのデフォルト値を設定
+            if "interest_products" not in value:
+                value["interest_products"] = {
+                    ProductType.LOAN.value: 0.5,
+                    ProductType.INVESTMENT.value: 0.5,
+                    ProductType.DEPOSIT.value: 0.5,
+                    ProductType.INSURANCE.value: 0.5,
+                    ProductType.OTHER.value: 0.5,
+                }
+
+        return super().model_validate(value, **kwargs)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "サンプル株式会社",
+                "location": "東京都千代田区",
+                "industry": "製造業",
+                "business_description": "電子部品の製造",
+                "employee_count": 100,
+                "annual_sales": "10億円",
+                "funding_status": "安定",
+                "future_plans": "海外展開を検討中",
+                "banking_relationships": "メインバンクとして取引中",
+                "financial_needs": "運転資金",
+                "content": "",
+                "personality_traits": ["analytical", "cooperative"],
+                "decision_making_style": "慎重",
+                "risk_tolerance": 0.5,
+                "financial_literacy": 0.7,
+                "current_interest_score": {
+                    "score": 50.0,
+                    "level": "moderate",
+                    "factors": {},
+                    "timestamp": datetime.now().isoformat(),
+                },
+                "negotiation_progress": {
+                    "stage": "initial",
+                    "key_concerns": [],
+                    "decision_criteria": [],
+                    "required_information": [],
+                    "evaluation_points": {},
+                    "last_updated": datetime.now().isoformat(),
+                },
+            }
+        }
 
     def calculate_interest_score(
         self,
@@ -454,6 +709,7 @@ class CompanyPersona(BasePersona):
             product_type=product_type,
             level=InterestLevel.MODERATE,  # 仮の値、calculate_levelで更新
             factors=factors,
+            timestamp=datetime.now().isoformat(),
         )
 
         # 興味レベルの判定（設定パラメータを使用）
@@ -479,9 +735,14 @@ class CompanyPersona(BasePersona):
         return interest_score
 
     def determine_response_type(
-        self, interest_score: InterestScore, config: Optional[SimulationConfig] = None
+        self,
+        interest_score: Optional[InterestScore] = None,
+        config: Optional[SimulationConfig] = None,
     ) -> ResponseType:
         """興味度スコアから応答タイプを決定"""
+        # interest_scoreが指定されていない場合は現在のスコアを使用
+        score_to_use = interest_score or self.current_interest_score
+
         # 性格特性による基準値の調整
         threshold_modifier = 0.0
         for trait in self.personality_traits:
@@ -501,7 +762,7 @@ class CompanyPersona(BasePersona):
             thresholds.update(config.response_type_thresholds)
 
         # スコアに基づく応答タイプの決定
-        adjusted_score = interest_score.score
+        adjusted_score = score_to_use.score
         if adjusted_score >= (thresholds["acceptance"] + threshold_modifier):
             response_type = ResponseType.ACCEPTANCE
         elif adjusted_score >= (thresholds["positive"] + threshold_modifier):
@@ -706,6 +967,314 @@ class CompanyPersona(BasePersona):
             except (ValueError, AttributeError):
                 pass
 
+    def evaluate_proposal(self, proposal: Proposal) -> EvaluationResult:
+        """提案内容を評価し、判断を行う"""
+        # 評価基準に基づくスコアリング
+        scores = self._calculate_evaluation_scores(proposal)
+
+        # 懸念事項の確認
+        concerns = self._identify_remaining_concerns(proposal)
+
+        # 判断基準の充足確認
+        criteria_met = self._check_decision_criteria(proposal)
+
+        # 最終判断
+        if self._is_ready_for_decision(scores, concerns, criteria_met):
+            decision = self._make_final_decision(scores, concerns, criteria_met)
+            return EvaluationResult(
+                decision=decision, scores=scores, concerns=concerns, required_info=None
+            )
+        else:
+            return EvaluationResult(
+                decision="pending",
+                scores=scores,
+                concerns=concerns,
+                required_info=self._identify_required_information(proposal),
+            )
+
+    def _calculate_evaluation_scores(self, proposal: Proposal) -> Dict[str, float]:
+        """提案内容の各評価基準に対するスコアを計算"""
+        scores = {}
+
+        # コスト評価
+        cost_score = self._evaluate_cost(proposal.cost_information)
+        scores[EvaluationCriteria.COST.value] = cost_score
+
+        # リスク評価
+        risk_score = self._evaluate_risk(proposal.risks)
+        scores[EvaluationCriteria.RISK.value] = risk_score
+
+        # メリット評価
+        benefit_score = self._evaluate_benefits(proposal.benefits)
+        scores[EvaluationCriteria.BENEFIT.value] = benefit_score
+
+        # 実現可能性評価
+        feasibility_score = self._evaluate_feasibility(proposal)
+        scores[EvaluationCriteria.FEASIBILITY.value] = feasibility_score
+
+        # サポート体制評価
+        support_score = self._evaluate_support(proposal.support_details)
+        scores[EvaluationCriteria.SUPPORT.value] = support_score
+
+        # 実績評価
+        track_record_score = self._evaluate_track_record(proposal.track_record)
+        scores[EvaluationCriteria.TRACK_RECORD.value] = track_record_score
+
+        return scores
+
+    def _evaluate_cost(self, cost_info: Dict[str, Any]) -> float:
+        """コスト面の評価を行う"""
+        # リスク許容度と金融リテラシーを考慮した評価
+        base_score = 0.5
+
+        if "total_cost" in cost_info:
+            cost_ratio = cost_info["total_cost"] / float(self.annual_sales)
+            if cost_ratio < 0.01:  # コストが年商の1%未満
+                base_score += 0.3
+            elif cost_ratio < 0.05:  # コストが年商の5%未満
+                base_score += 0.1
+            else:
+                base_score -= 0.2
+
+        # リスク許容度による調整
+        base_score *= 0.5 + 0.5 * self.risk_tolerance
+
+        return min(1.0, max(0.0, base_score))
+
+    def _evaluate_risk(self, risks: List[str]) -> float:
+        """リスク面の評価を行う"""
+        base_score = 0.5
+        risk_count = len(risks)
+
+        # リスクの数による基本スコア調整
+        if risk_count == 0:
+            base_score += 0.3
+        elif risk_count <= 2:
+            base_score += 0.1
+        else:
+            base_score -= 0.1 * risk_count
+
+        # リスク許容度による調整
+        risk_tolerance_factor = 0.5 + 0.5 * self.risk_tolerance
+        base_score *= risk_tolerance_factor
+
+        return min(1.0, max(0.0, base_score))
+
+    def _evaluate_benefits(self, benefits: List[str]) -> float:
+        """メリット面の評価を行う"""
+        base_score = 0.5
+        benefit_count = len(benefits)
+
+        # メリットの数による基本スコア調整
+        base_score += 0.1 * benefit_count
+
+        # 金融リテラシーによる調整
+        literacy_factor = 0.5 + 0.5 * self.financial_literacy
+        base_score *= literacy_factor
+
+        return min(1.0, max(0.0, base_score))
+
+    def _evaluate_feasibility(self, proposal: Proposal) -> float:
+        """実現可能性の評価を行う"""
+        base_score = 0.7  # 基本的に実現可能性は高めに設定
+
+        # 商品タイプに応じた調整
+        if proposal.product_type == ProductType.LOAN:
+            # ローンの場合、財務状況との整合性を確認
+            if "annual_sales" in proposal.terms:
+                sales_ratio = float(proposal.terms["annual_sales"]) / float(
+                    self.annual_sales
+                )
+                if sales_ratio > 0.5:  # 年商の50%を超える場合
+                    base_score -= 0.3
+                elif sales_ratio > 0.3:  # 年商の30%を超える場合
+                    base_score -= 0.1
+
+        return min(1.0, max(0.0, base_score))
+
+    def _evaluate_support(self, support_details: Dict[str, Any]) -> float:
+        """サポート体制の評価を行う"""
+        base_score = 0.5
+
+        # サポート内容の充実度による調整
+        if (
+            "dedicated_support" in support_details
+            and support_details["dedicated_support"]
+        ):
+            base_score += 0.2
+        if "online_support" in support_details and support_details["online_support"]:
+            base_score += 0.1
+        if "24h_support" in support_details and support_details["24h_support"]:
+            base_score += 0.1
+
+        return min(1.0, max(0.0, base_score))
+
+    def _evaluate_track_record(self, track_record: List[Dict[str, Any]]) -> float:
+        """実績の評価を行う"""
+        base_score = 0.5
+
+        if not track_record:
+            return base_score
+
+        # 実績数による調整
+        success_count = sum(
+            1 for record in track_record if record.get("success", False)
+        )
+        success_ratio = success_count / len(track_record)
+
+        base_score += 0.3 * success_ratio
+
+        # 同業種の実績による追加ボーナス
+        industry_matches = sum(
+            1 for record in track_record if record.get("industry") == self.industry
+        )
+        if industry_matches > 0:
+            base_score += 0.2
+
+        return min(1.0, max(0.0, base_score))
+
+    def _identify_remaining_concerns(self, proposal: Proposal) -> List[str]:
+        """未解決の懸念事項を特定"""
+        concerns = []
+
+        # コストに関する懸念
+        if self._evaluate_cost(proposal.cost_information) < 0.6:
+            concerns.append("コストが高い")
+
+        # リスクに関する懸念
+        if self._evaluate_risk(proposal.risks) < 0.6:
+            concerns.append("リスクが高い")
+
+        # 実現可能性に関する懸念
+        if self._evaluate_feasibility(proposal) < 0.6:
+            concerns.append("実現可能性に不安がある")
+
+        # サポート体制に関する懸念
+        if self._evaluate_support(proposal.support_details) < 0.6:
+            concerns.append("サポート体制が不十分")
+
+        # 実績に関する懸念
+        if self._evaluate_track_record(proposal.track_record) < 0.6:
+            concerns.append("実績が不十分")
+
+        return concerns
+
+    def _check_decision_criteria(self, proposal: Proposal) -> Dict[str, bool]:
+        """判断基準の充足状況を確認"""
+        criteria_met = {}
+
+        # 各評価基準のスコアを計算
+        scores = self._calculate_evaluation_scores(proposal)
+
+        # 基準の充足確認
+        for criteria in EvaluationCriteria:
+            criteria_met[criteria.value] = scores.get(criteria.value, 0.0) >= 0.7
+
+        return criteria_met
+
+    def _is_ready_for_decision(
+        self,
+        scores: Dict[str, float],
+        concerns: List[str],
+        criteria_met: Dict[str, bool],
+    ) -> bool:
+        """判断可能な状態かを確認"""
+        # 重要な判断基準が満たされているか確認
+        essential_criteria = [
+            EvaluationCriteria.COST.value,
+            EvaluationCriteria.RISK.value,
+            EvaluationCriteria.BENEFIT.value,
+        ]
+
+        if not all(
+            criteria_met.get(criteria, False) for criteria in essential_criteria
+        ):
+            return False
+
+        # 重大な懸念事項が残っていないか確認
+        if len(concerns) > 2:  # 3つ以上の懸念事項がある場合
+            return False
+
+        # 十分な情報が得られているか確認
+        min_score = min(scores.values())
+        if min_score < 0.4:  # いずれかの評価が著しく低い場合
+            return False
+
+        return True
+
+    def _make_final_decision(
+        self,
+        scores: Dict[str, float],
+        concerns: List[str],
+        criteria_met: Dict[str, bool],
+    ) -> str:
+        """最終判断を行う"""
+        # 平均スコアの計算
+        avg_score = sum(scores.values()) / len(scores)
+
+        # 判断基準の充足率
+        criteria_met_ratio = sum(1 for met in criteria_met.values() if met) / len(
+            criteria_met
+        )
+
+        # 懸念事項の重要度評価
+        concern_weight = len(concerns) * 0.1
+
+        # 最終スコアの計算
+        final_score = avg_score * (1 - concern_weight) * criteria_met_ratio
+
+        # 性格特性による調整
+        if CustomerPersonalityTrait.CAUTIOUS in self.personality_traits:
+            final_score *= 0.9
+        if CustomerPersonalityTrait.COOPERATIVE in self.personality_traits:
+            final_score *= 1.1
+
+        # 判断
+        if final_score >= 0.8:
+            decision = "success"
+        elif final_score <= 0.4:
+            decision = "failed"
+        else:
+            decision = "pending"
+
+        # 判断理由の記録
+        reason = f"最終評価スコア: {final_score:.2f}, "
+        reason += f"判断基準充足率: {criteria_met_ratio:.2f}, "
+        if concerns:
+            reason += f"残存する懸念事項: {', '.join(concerns)}"
+
+        self.decision_making.record_decision(decision, reason)
+
+        return decision
+
+    def _identify_required_information(self, proposal: Proposal) -> List[str]:
+        """追加で必要な情報を特定"""
+        required_info = []
+
+        # コスト情報の確認
+        if not proposal.cost_information.get("total_cost"):
+            required_info.append("総コストの詳細")
+        if not proposal.cost_information.get("payment_terms"):
+            required_info.append("支払条件の詳細")
+
+        # リスク情報の確認
+        if not proposal.risks:
+            required_info.append("リスク評価の詳細")
+
+        # サポート情報の確認
+        if not proposal.support_details:
+            required_info.append("サポート体制の詳細")
+
+        # 実績情報の確認
+        if not proposal.track_record:
+            required_info.append("導入実績の詳細")
+        elif not any(
+            record.get("industry") == self.industry for record in proposal.track_record
+        ):
+            required_info.append("同業種での導入実績")
+
+        return required_info
+
 
 class Assignment(BaseModel):
     sales_persona: SalesPersona
@@ -721,8 +1290,8 @@ class SessionHistory(BaseModel):
     product_type: Optional[ProductType] = None
     success_score: Optional[float] = None
     timestamp: str = Field(
-        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
+        default_factory=lambda: datetime.now().isoformat()
+    )  # ISO形式に統一
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the history entry to a plain dictionary."""
@@ -736,6 +1305,17 @@ class SessionHistory(BaseModel):
         if self.success_score is not None:
             result["success_score"] = self.success_score
         return result
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "role": "assistant",
+                "content": "メッセージ内容",
+                "product_type": None,
+                "success_score": None,
+                "timestamp": datetime.now().isoformat(),
+            }
+        }
 
 
 class SessionSummary(BaseModel):

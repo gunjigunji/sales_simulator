@@ -15,7 +15,7 @@ class SimulationConfig:
     num_personas: int = 3
     num_visits: int = 3
     num_turns_per_visit: int = 8  # 4往復（営業担当→企業担当のやり取りを4回）
-    visit_interval_days: int = 1  # メール間隔（日数）
+    visit_interval_days: int = 30  # 訪問間隔（日数）
     model: str = "gpt-4.1-mini"
     temperature: float = 0.7
     max_tokens: int = 3000
@@ -187,15 +187,3 @@ class Prompts:
         "- すべてのやり取りはメールのみで完結したことを前提に報告してください\n"
         "- 訪問や面談に関する言及は避けてください"
     )
-
-
-# デフォルト設定
-DEFAULT_BANK_METADATA = BankMetadata(
-    bank_name="りそな銀行",
-    branch="本店営業部",
-    location="東京都千代田区",
-    services="住宅ローン、投資信託、預金サービス、シンジケートローン、M&Aマッチング",
-)
-
-DEFAULT_SIMULATION_CONFIG = SimulationConfig()
-DEFAULT_PROMPTS = Prompts()

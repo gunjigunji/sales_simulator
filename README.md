@@ -7,9 +7,9 @@
 ## システム構成
 このシステムは以下の主要なコンポーネントで構成されています：
 
-### 1. 設定管理（`src/config/settings.py`）
-- `BankMetadata`: 銀行の基本情報（名称、支店、所在地、提供サービス）を管理
-- `SimulationConfig`: シミュレーションの設定（メール交換回数、モデル設定など）
+### 1. モデル定義（`src/models/settings.py`）
+- `BankMetadata`: 銀行の基本情報（名称、支店、所在地、提供サービス）を定義
+- `SimulationConfig`: シミュレーションの設定（メール交換回数、モデル設定など）を定義
   - `num_personas`: 生成するペルソナの数
   - `num_visits`: メール交換の回数
   - `num_turns_per_visit`: 1回のメール交換での対話回数
@@ -19,14 +19,19 @@
   - `max_tokens`: 生成する最大トークン数
   - `min_success_score`: 成功判定の閾値
   - `max_attempts_per_visit`: 1回のメール交換での最大試行回数
-- `Prompts`: 各AIエージェントのプロンプトテンプレートを管理
+- `Prompts`: 各AIエージェントのプロンプトテンプレートを定義
   - `company_prompt`: 企業ペルソナ生成用プロンプト
   - `sales_prompt`: 営業担当ペルソナ生成用プロンプト
   - `system_prompt_sales_bank`: 営業担当のメール作成用プロンプト
   - `system_prompt_customer_bank`: 企業担当のメール作成用プロンプト
   - `system_prompt_record_bank`: メール交換記録生成用プロンプト
 
-### 2. ペルソナ管理（`src/models/persona.py`）
+### 2. デフォルト設定（`src/config/defaults.py`）
+- デフォルトの銀行情報（`DEFAULT_BANK_METADATA`）
+- デフォルトのシミュレーション設定（`DEFAULT_SIMULATION_CONFIG`）
+- デフォルトのプロンプト設定（`DEFAULT_PROMPTS`）
+
+### 3. ペルソナ管理（`src/models/persona.py`）
 - `SalesPersona`: 営業担当者の属性
   - 基本情報（名前、年齢、担当エリア）
   - 営業実績
@@ -72,7 +77,7 @@
   - 商品タイプ
   - 成功スコア
 
-### 3. シミュレーションサービス（`src/services/simulation_service.py`）
+### 4. シミュレーションサービス（`src/services/simulation_service.py`）
 - `SimulationService`: 営業シミュレーションの主要ロジックを実装
   - ペルソナの生成
     - 企業と営業担当のペルソナを自動生成
@@ -91,14 +96,14 @@
     - 各メール交換セッションの詳細な記録を生成
     - メール交換日時、担当者、企業情報、メール内容、提案内容などを含む
 
-### 4. OpenAIクライアント（`src/services/openai_client.py`）
+### 5. OpenAIクライアント（`src/services/openai_client.py`）
 - `OpenAIClient`: OpenAI APIとの通信を管理
   - チャットAPIの呼び出し
   - 構造化されたJSON出力の生成
   - エラーハンドリング
   - モデルパラメータの制御
 
-### 5. メイン実行（`src/main.py`）
+### 6. メイン実行（`src/main.py`）
 - シミュレーションの実行フローを管理
   - サービスの初期化
   - ペルソナの生成

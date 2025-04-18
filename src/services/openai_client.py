@@ -5,7 +5,7 @@ from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, cast
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
-from src.config.settings import SimulationConfig
+from src.models.settings import SimulationConfig
 
 T = TypeVar("T", bound=BaseModel)
 
