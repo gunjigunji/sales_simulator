@@ -130,6 +130,77 @@ class SalesPersona(BasePersona):
         return min(1.0, max(0.0, success_rate))
 
 
+class CompanyContactPersona(BaseModel):
+    """企業担当者のペルソナ"""
+
+    name: str
+    position: str  # 役職
+    age: int
+    years_in_company: int  # 入社年数
+    personality_traits: List[CustomerPersonalityTrait]
+    decision_making_style: str  # 意思決定スタイル
+    risk_tolerance: float = Field(ge=0.0, le=1.0)  # リスク許容度
+    financial_literacy: float = Field(ge=0.0, le=1.0)  # 金融リテラシー
+    communication_style: str  # コミュニケーションスタイル
+    stress_tolerance: float = Field(ge=0.0, le=1.0)  # ストレス耐性
+    adaptability: float = Field(ge=0.0, le=1.0)  # 適応力
+    content: str  # 元のテキスト形式の内容を保持
+
+    def calculate_response_style(self) -> Dict[str, float]:
+        """性格特性に基づいて応答スタイルを計算"""
+        style = {
+            "formality": 0.5,  # フォーマル度
+            "detail": 0.5,  # 詳細度
+            "speed": 0.5,  # 返信速度
+            "cooperation": 0.5,  # 協力度
+        }
+
+        # 性格特性による調整
+        for trait in self.personality_traits:
+            if trait == CustomerPersonalityTrait.AUTHORITATIVE:
+                style["formality"] += 0.2
+                style["cooperation"] -= 0.1
+            elif trait == CustomerPersonalityTrait.COOPERATIVE:
+                style["cooperation"] += 0.2
+                style["speed"] += 0.1
+            elif trait == CustomerPersonalityTrait.SKEPTICAL:
+                style["detail"] += 0.2
+                style["speed"] -= 0.1
+            elif trait == CustomerPersonalityTrait.TRUSTING:
+                style["cooperation"] += 0.2
+                style["speed"] += 0.1
+            elif trait == CustomerPersonalityTrait.DETAIL_ORIENTED:
+                style["detail"] += 0.3
+                style["speed"] -= 0.2
+            elif trait == CustomerPersonalityTrait.BIG_PICTURE:
+                style["detail"] -= 0.2
+                style["speed"] += 0.1
+            elif trait == CustomerPersonalityTrait.IMPULSIVE:
+                style["speed"] += 0.3
+                style["detail"] -= 0.2
+            elif trait == CustomerPersonalityTrait.ANALYTICAL:
+                style["detail"] += 0.3
+                style["speed"] -= 0.2
+
+        # その他の属性による調整
+        style["formality"] += (
+            0.1 * self.years_in_company / 10
+        )  # 年数によるフォーマル度の増加
+        style["detail"] += (
+            0.2 * self.financial_literacy
+        )  # 金融リテラシーによる詳細度の増加
+        style["speed"] += 0.2 * self.adaptability  # 適応力による速度の増加
+        style["cooperation"] += (
+            0.2 * self.stress_tolerance
+        )  # ストレス耐性による協力度の増加
+
+        # 値を0.0-1.0の範囲に制限
+        for key in style:
+            style[key] = max(0.0, min(1.0, style[key]))
+
+        return style
+
+
 class CompanyPersona(BasePersona):
     name: str
     location: str
@@ -155,9 +226,14 @@ class CompanyPersona(BasePersona):
             ProductType.OTHER: 0.5,
         }
     )
+    contact_person: Optional[CompanyContactPersona] = None  # 企業担当者を追加
 
     def update_situation(self, days_passed: int) -> None:
         """経過日数に応じて企業の状況を更新する"""
+        # 変化率の初期化
+        sales_change_rate = 0.0
+        employee_change_rate = 0.0
+
         # 売上規模の変化（性格特性に応じて変動幅を調整）
         try:
             sales_str = "".join(filter(str.isdigit, self.annual_sales))
@@ -173,8 +249,8 @@ class CompanyPersona(BasePersona):
             if CustomerPersonalityTrait.CAUTIOUS in self.personality_traits:
                 volatility *= 0.7
 
-            change_rate = random.uniform(-volatility, volatility)
-            new_sales = current_sales * (1 + change_rate)
+            sales_change_rate = random.uniform(-volatility, volatility)
+            new_sales = current_sales * (1 + sales_change_rate)
             self.annual_sales = f"{new_sales:.1f}億円"
         except (ValueError, AttributeError):
             pass
@@ -187,8 +263,8 @@ class CompanyPersona(BasePersona):
             if CustomerPersonalityTrait.CAUTIOUS in self.personality_traits:
                 volatility *= 0.7
 
-            change_rate = random.uniform(-volatility, volatility)
-            self.employee_count = int(self.employee_count * (1 + change_rate))
+            employee_change_rate = random.uniform(-volatility, volatility)
+            self.employee_count = int(self.employee_count * (1 + employee_change_rate))
         except (ValueError, AttributeError):
             pass
 
@@ -235,6 +311,71 @@ class CompanyPersona(BasePersona):
                 )
         except (ValueError, AttributeError):
             pass
+
+        # 企業担当者の状況も更新
+        if self.contact_person:
+            # ストレス耐性の変化（企業の状況に応じて）
+            try:
+                # 売上減少や資金ニーズの緊急性が高い場合、ストレスが増加
+                stress_change = 0.0
+                if "減少" in self.annual_sales:
+                    stress_change += 0.1
+                if "緊急" in self.financial_needs:
+                    stress_change += 0.15
+
+                # 基本変動
+                base_stress_change = random.uniform(-0.05, 0.05)
+                stress_change += base_stress_change
+
+                # 性格特性による調整
+                if (
+                    CustomerPersonalityTrait.IMPULSIVE
+                    in self.contact_person.personality_traits
+                ):
+                    stress_change *= 1.2
+                if (
+                    CustomerPersonalityTrait.CAUTIOUS
+                    in self.contact_person.personality_traits
+                ):
+                    stress_change *= 0.8
+
+                self.contact_person.stress_tolerance = max(
+                    0.0, min(1.0, self.contact_person.stress_tolerance - stress_change)
+                )
+            except (ValueError, AttributeError):
+                pass
+
+            # 適応力の変化（企業の状況に応じて）
+            try:
+                # 企業の変化が大きい場合、適応力が向上
+                adaptability_change = 0.0
+                if (
+                    abs(sales_change_rate) > 0.1 or abs(employee_change_rate) > 0.1
+                ):  # 大きな変化があった場合
+                    adaptability_change += 0.05
+
+                # 基本変動
+                base_adaptability_change = random.uniform(-0.03, 0.03)
+                adaptability_change += base_adaptability_change
+
+                # 性格特性による調整
+                if (
+                    CustomerPersonalityTrait.ANALYTICAL
+                    in self.contact_person.personality_traits
+                ):
+                    adaptability_change *= 1.1
+                if (
+                    CustomerPersonalityTrait.IMPULSIVE
+                    in self.contact_person.personality_traits
+                ):
+                    adaptability_change *= 0.9
+
+                self.contact_person.adaptability = max(
+                    0.0,
+                    min(1.0, self.contact_person.adaptability + adaptability_change),
+                )
+            except (ValueError, AttributeError):
+                pass
 
 
 class Assignment(BaseModel):

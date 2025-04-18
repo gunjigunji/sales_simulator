@@ -167,6 +167,24 @@ def main():
                         product_type.value: score
                         for product_type, score in persona.interest_products.items()
                     },
+                    "contact_person": {
+                        "name": persona.contact_person.name,
+                        "position": persona.contact_person.position,
+                        "age": persona.contact_person.age,
+                        "years_in_company": persona.contact_person.years_in_company,
+                        "personality_traits": [
+                            trait.value
+                            for trait in persona.contact_person.personality_traits
+                        ],
+                        "decision_making_style": persona.contact_person.decision_making_style,
+                        "risk_tolerance": persona.contact_person.risk_tolerance,
+                        "financial_literacy": persona.contact_person.financial_literacy,
+                        "communication_style": persona.contact_person.communication_style,
+                        "stress_tolerance": persona.contact_person.stress_tolerance,
+                        "adaptability": persona.contact_person.adaptability,
+                    }
+                    if persona.contact_person
+                    else None,
                 }
                 for persona in company_personas
             ],

@@ -122,6 +122,12 @@ class SimulationService:
         visit_date: Optional[datetime] = None,
     ) -> SessionSummary:
         """1回の訪問セッションのシミュレーションを実施"""
+        # 企業担当者の情報が存在することを確認
+        if not company_persona.contact_person:
+            raise ValueError(
+                f"企業担当者の情報が設定されていません: {company_persona.name}"
+            )
+
         session_history = []
         current_visit_date = visit_date or datetime.now()
 
@@ -151,9 +157,18 @@ class SimulationService:
             - 事業内容：{company_persona.business_description}
             - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
 
+            企業担当者情報：
+            - 名前：{company_persona.contact_person.name}
+            - 役職：{company_persona.contact_person.position}
+            - 年齢：{company_persona.contact_person.age}
+            - 入社年数：{company_persona.contact_person.years_in_company}
+            - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
+            - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
+
             営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
 
             初回のメールであることを考慮し、適切な挨拶と自己紹介を含めてください。
+            企業担当者の役職に応じた敬称（例：部長、課長など）を使用してください。
             """
         else:
             # 前回のやり取りから商品提案の進捗状況を抽出
@@ -188,6 +203,14 @@ class SimulationService:
             - 事業内容：{company_persona.business_description}
             - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
 
+            企業担当者情報：
+            - 名前：{company_persona.contact_person.name}
+            - 役職：{company_persona.contact_person.position}
+            - 年齢：{company_persona.contact_person.age}
+            - 入社年数：{company_persona.contact_person.years_in_company}
+            - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
+            - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
+
             営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
 
             前回のやり取りの状況：
@@ -196,6 +219,7 @@ class SimulationService:
 
             前回のやり取りを踏まえて、適切なフォローアップと新たな提案を行ってください。
             前回の提案に対する企業様の反応を考慮し、必要に応じて提案内容を調整してください。
+            企業担当者の役職に応じた敬称（例：部長、課長など）を使用してください。
             """
 
         try:
@@ -205,7 +229,7 @@ class SimulationService:
                 temperature=0.3,
             )
             initial_email.sender = sales_persona.name
-            initial_email.recipient = company_persona.name
+            initial_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
             session_history.append(
                 SessionHistory(
                     role="assistant",
@@ -221,7 +245,7 @@ class SimulationService:
                 default_email = EmailMessage(
                     subject="ご挨拶と今後のご提案について",
                     body=f"""
-                    {company_persona.name} 御中
+                    {company_persona.contact_person.name} {company_persona.contact_person.position} 様
 
                     平素より大変お世話になっております。
                     {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}と申します。
@@ -236,13 +260,13 @@ class SimulationService:
                     何卒よろしくお願い申し上げます。
                     """,
                     sender=sales_persona.name,
-                    recipient=company_persona.name,
+                    recipient=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
                 )
             else:
                 default_email = EmailMessage(
                     subject="前回のご提案についてのフォローアップ",
                     body=f"""
-                    {company_persona.name} 御中
+                    {company_persona.contact_person.name} {company_persona.contact_person.position} 様
 
                     平素より大変お世話になっております。
                     {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}でございます。
@@ -257,7 +281,7 @@ class SimulationService:
                     何卒よろしくお願い申し上げます。
                     """,
                     sender=sales_persona.name,
-                    recipient=company_persona.name,
+                    recipient=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
                 )
             session_history.append(
                 SessionHistory(
@@ -293,6 +317,14 @@ class SimulationService:
                 - 事業内容：{company_persona.business_description}
                 - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
 
+                企業担当者情報：
+                - 名前：{company_persona.contact_person.name}
+                - 役職：{company_persona.contact_person.position}
+                - 年齢：{company_persona.contact_person.age}
+                - 入社年数：{company_persona.contact_person.years_in_company}
+                - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
+                - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
+
                 会話履歴：
                 {[h.content for h in session_history]}
                 """
@@ -304,7 +336,7 @@ class SimulationService:
                         temperature=0.3,
                     )
                     sales_email.sender = sales_persona.name
-                    sales_email.recipient = company_persona.name
+                    sales_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
 
                     # 提案内容の分析
                     analysis_messages = [
@@ -323,6 +355,9 @@ class SimulationService:
 
                             企業情報：
                             {company_persona.model_dump_json()}
+
+                            企業担当者情報：
+                            {company_persona.contact_person.model_dump_json()}
 
                             前回のやり取り：
                             {[h.content for h in session_history]}
@@ -382,6 +417,19 @@ class SimulationService:
                 - リスク許容度：{company_persona.risk_tolerance}
                 - 金融リテラシー：{company_persona.financial_literacy}
 
+                企業担当者情報：
+                - 名前：{company_persona.contact_person.name}
+                - 役職：{company_persona.contact_person.position}
+                - 年齢：{company_persona.contact_person.age}
+                - 入社年数：{company_persona.contact_person.years_in_company}
+                - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
+                - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
+                - 意思決定スタイル：{company_persona.contact_person.decision_making_style}
+                - リスク許容度：{company_persona.contact_person.risk_tolerance}
+                - 金融リテラシー：{company_persona.contact_person.financial_literacy}
+                - ストレス耐性：{company_persona.contact_person.stress_tolerance}
+                - 適応力：{company_persona.contact_person.adaptability}
+
                 営業担当者情報：
                 - 名前：{sales_persona.name}
                 - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
@@ -395,6 +443,7 @@ class SimulationService:
                 営業担当者の提案に対する反応は、あなたの性格特性、意思決定スタイル、リスク許容度、金融リテラシーを反映してください。
                 すべてのやり取りはメールのみで完結させ、訪問や面談に関する言及は避けてください。
                 メールでの質問や要望は十分に詳細に行ってください。
+                あなたの役職に応じた適切な敬称（例：様）を使用してください。
                 """
 
                 try:
@@ -403,7 +452,7 @@ class SimulationService:
                         response_model=EmailMessage,
                         temperature=0.3,
                     )
-                    customer_email.sender = company_persona.name
+                    customer_email.sender = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
                     customer_email.recipient = sales_persona.name
 
                     session_history.append(
@@ -427,7 +476,7 @@ class SimulationService:
 
                         何卒よろしくお願い申し上げます。
                         """,
-                        sender=company_persona.name,
+                        sender=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
                         recipient=sales_persona.name,
                     )
                     session_history.append(
@@ -479,6 +528,19 @@ class SimulationService:
         訪問先：{company_persona.name}
         訪問日：{session_summary.visit_date}
         訪問回数：{session_summary.session_num}回目
+
+        企業担当者情報：
+        - 名前：{company_persona.contact_person.name}
+        - 役職：{company_persona.contact_person.position}
+        - 年齢：{company_persona.contact_person.age}
+        - 入社年数：{company_persona.contact_person.years_in_company}
+        - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
+        - 意思決定スタイル：{company_persona.contact_person.decision_making_style}
+        - リスク許容度：{company_persona.contact_person.risk_tolerance}
+        - 金融リテラシー：{company_persona.contact_person.financial_literacy}
+        - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
+        - ストレス耐性：{company_persona.contact_person.stress_tolerance}
+        - 適応力：{company_persona.contact_person.adaptability}
 
         メールのやり取り：
         {chr(10).join(email_history)}
