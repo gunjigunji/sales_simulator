@@ -1,6 +1,7 @@
 import random
+from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -249,6 +250,22 @@ class SessionHistory(BaseModel):
     content: str
     product_type: Optional[ProductType] = None
     success_score: Optional[float] = None
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the history entry to a plain dictionary."""
+        result: Dict[str, Any] = {
+            "role": self.role,
+            "timestamp": self.timestamp,
+            "content": self.content,
+        }
+        if self.product_type is not None:
+            result["product_type"] = self.product_type.value
+        if self.success_score is not None:
+            result["success_score"] = self.success_score
+        return result
 
 
 class SessionSummary(BaseModel):
@@ -276,3 +293,73 @@ class SimulationResult(BaseModel):
     overall_meeting_log: str
     final_status: SalesStatus
     matched_products: List[ProductType]
+
+
+class ProposalAnalysis(BaseModel):
+    """営業提案の分析結果を構造化するモデル"""
+
+    product_type: ProductType
+    success_score: float = Field(ge=0.0, le=1.0)
+    reasoning: str
+    customer_reaction: str
+    next_steps: List[str] = Field(default_factory=list)
+    concerns: List[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0, default=0.8)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "product_type": "loan",
+                "success_score": 0.75,
+                "reasoning": "企業の資金ニーズと商品の特徴が一致している",
+                "customer_reaction": "前向きな反応を示している",
+                "next_steps": ["詳細な条件提示", "審査書類の準備"],
+                "concerns": ["金利水準", "担保条件"],
+                "confidence": 0.85,
+            }
+        }
+
+
+class EmailMessage(BaseModel):
+    """メール形式のメッセージを構造化するモデル"""
+
+    subject: str = Field(description="メールの件名")
+    body: str = Field(description="メールの本文")
+    sender: str = Field(description="送信者名")
+    recipient: str = Field(description="受信者名")
+    date: str = Field(
+        description="送信日時",
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    product_type: Optional[ProductType] = Field(
+        default=None, description="関連する商品タイプ"
+    )
+    success_score: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0, description="成功スコア"
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """メッセージを辞書形式に変換"""
+        result: Dict[str, Any] = {
+            "subject": self.subject,
+            "body": self.body,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "date": self.date,
+        }
+        if self.product_type is not None:
+            result["product_type"] = self.product_type.value
+        if self.success_score is not None:
+            result["success_score"] = self.success_score
+        return result
+
+    def format_as_email(self) -> str:
+        """メール形式で整形して返す"""
+        return f"""
+件名: {self.subject}
+送信者: {self.sender}
+受信者: {self.recipient}
+日時: {self.date}
+
+{self.body}
+"""

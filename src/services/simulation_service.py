@@ -1,15 +1,16 @@
 import json
 import random
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.config.settings import BankMetadata, Prompts, SimulationConfig
 from src.models.persona import (
     Assignment,
     CompanyPersona,
     CustomerPersonalityTrait,
+    EmailMessage,
     ExperienceLevel,
     MeetingLog,
     PersonalityTrait,
@@ -21,30 +22,8 @@ from src.models.persona import (
     SessionSummary,
     SimulationResult,
 )
+from src.models.proposal_analysis import ProposalAnalysis
 from src.services.openai_client import OpenAIClient
-
-
-class SessionHistory(BaseModel):
-    role: str
-    content: str
-    product_type: Optional[ProductType] = None
-    success_score: Optional[float] = None
-    timestamp: str = Field(
-        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        """会話履歴を辞書形式に変換"""
-        result = {
-            "role": self.role,
-            "timestamp": self.timestamp,
-            "content": self.content,
-        }
-        if self.product_type:
-            result["product_type"] = self.product_type.value
-        if self.success_score is not None:
-            result["success_score"] = self.success_score
-        return result
 
 
 class SimulationService:
@@ -65,164 +44,68 @@ class SimulationService:
     ) -> List[Union[SalesPersona, CompanyPersona]]:
         """ペルソナを生成する"""
         personas = []
+        PersonaModel: Type[Union[SalesPersona, CompanyPersona]] = (
+            SalesPersona if persona_type == "sales" else CompanyPersona
+        )
+
+        # プロンプトにJSON出力の指示を追加
+        system_prompt = f"""
+        {prompt}
+
+        あなたは指定されたペルソナタイプの情報を生成するエキスパートです。
+        応答は必ず指定されたJSONスキーマに準拠したJSONオブジェクトのみを返してください。
+        余分なテキストや説明は一切含めないでください。
+        `annual_sales` は必ず「XX億円」のような文字列形式で出力してください。
+        """
+
         for i in range(self.config.num_personas):
-            # JSONスキーマを取得
-            schema = self._get_persona_schema(persona_type)
-
-            # より具体的な指示を含むプロンプトを作成
-            enhanced_prompt = f"""
-            {prompt}
-
-            以下の点に注意してください：
-            1. 出力は必ずJSON形式で行ってください
-            2. 以下のJSONスキーマに厳密に従ってください
-            3. 数値は必ず数値型として出力してください（文字列ではありません）
-            4. 配列は必ず配列として出力してください
-            5. 列挙型の値は指定された値のいずれかを使用してください
-            6. 余分なテキストや説明は含めないでください
-            7. JSONの開始と終了を示す中括弧のみを出力してください
-            8. 文字列型のフィールド（例：name, location, annual_salesなど）は必ず文字列として出力してください
-            9. annual_salesは必ず「XX億円」のような文字列形式で出力してください
-
-            JSONスキーマ：
-            {schema}
-            """
-
             messages = [
-                {"role": "system", "content": enhanced_prompt},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": f"ペルソナ{i + 1}の情報を生成してください。",
                 },
             ]
 
-            # 温度パラメータを下げて、より確実なJSON生成を促す
-            response = self.openai_client.call_chat_api(
-                messages, temperature=0.3, max_tokens=3000
-            )
-
             try:
-                # JSONレスポンスをパース
-                persona_data = json.loads(response)
-                # 元のテキスト形式の内容も保持
-                persona_data["content"] = response
-
-                if persona_type == "sales":
-                    persona = SalesPersona(**persona_data)
-                else:
-                    # annual_salesが数値型の場合は文字列型に変換
-                    if isinstance(persona_data.get("annual_sales"), (int, float)):
-                        persona_data["annual_sales"] = (
-                            f"{persona_data['annual_sales']}億円"
-                        )
-                    persona = CompanyPersona(**persona_data)
-
-                personas.append(persona)
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON response: {e}")
-                print(f"Raw response: {response}")
-                # フォールバックとして元の実装を使用
-                personas.append(
-                    SalesPersona(
-                        id=f"{persona_type}_{i + 1}",
-                        type=persona_type,
-                        name="",
-                        age=0,
-                        area="",
-                        experience_level=ExperienceLevel.JUNIOR,
-                        personality_traits=[PersonalityTrait.INEXPERIENCED],
-                        achievements=[],
-                        specialties=[],
-                        characteristics=[],
-                        communication_style="",
-                        stress_tolerance=0.5,
-                        adaptability=0.5,
-                        product_knowledge=0.5,
-                        content=response,
-                    )
-                    if persona_type == "sales"
-                    else CompanyPersona(
-                        id=f"{persona_type}_{i + 1}",
-                        type=persona_type,
-                        name="",
-                        location="",
-                        industry="",
-                        business_description="",
-                        employee_count=0,
-                        annual_sales="0億円",
-                        funding_status="",
-                        future_plans="",
-                        banking_relationships="",
-                        financial_needs="",
-                        personality_traits=[CustomerPersonalityTrait.COOPERATIVE],
-                        decision_making_style="慎重",
-                        risk_tolerance=0.5,
-                        financial_literacy=0.5,
-                        interest_products={
-                            ProductType.LOAN: 0.5,
-                            ProductType.INVESTMENT: 0.5,
-                            ProductType.DEPOSIT: 0.5,
-                            ProductType.INSURANCE: 0.5,
-                            ProductType.OTHER: 0.5,
-                        },
-                        content=response,
-                    )
+                # call_structured_api を使用
+                persona = self.openai_client.call_structured_api(
+                    messages,
+                    response_model=PersonaModel,
+                    temperature=0.3,  # 低めの温度で安定性を高める
+                    max_tokens=3000,
                 )
-        return personas
+                # IDとタイプが未設定の場合に設定 (LLMが省略することがあるため)
+                if not persona.id:
+                    persona.id = f"{persona_type}_{i + 1}"
+                if not persona.type:
+                    persona.type = persona_type
+                personas.append(persona)
 
-    def _get_persona_schema(self, persona_type: str) -> str:
-        """ペルソナタイプに応じたJSONスキーマを返す"""
-        if persona_type == "sales":
-            return """{
-                "id": "sales_1",
-                "type": "sales",
-                "name": "営業担当者の名前",
-                "age": 35,
-                "area": "担当エリア",
-                "experience_level": "junior|middle|senior|veteran",
-                "personality_traits": ["aggressive", "cautious", "friendly", "professional", "inexperienced", "knowledgeable", "impatient", "patient"],
-                "achievements": ["営業実績1", "営業実績2"],
-                "specialties": ["得意商品1", "得意商品2"],
-                "characteristics": ["特徴1", "特徴2"],
-                "communication_style": "コミュニケーションスタイル",
-                "stress_tolerance": 0.8,
-                "adaptability": 0.7,
-                "product_knowledge": 0.9
-            }"""
-        else:
-            return """{
-                "id": "company_1",
-                "type": "company",
-                "name": "企業名",
-                "location": "所在地",
-                "industry": "業種",
-                "business_description": "事業内容",
-                "employee_count": 100,
-                "annual_sales": "売上規模（例：32億円）",
-                "funding_status": "資金調達状況",
-                "future_plans": "今後の事業計画",
-                "banking_relationships": "金融機関との取引状況",
-                "financial_needs": "具体的な資金ニーズ",
-                "personality_traits": ["authoritative", "cooperative", "skeptical", "trusting", "detail_oriented", "big_picture", "impulsive", "analytical"],
-                "decision_making_style": "独断的|合議的|慎重",
-                "risk_tolerance": 0.5,
-                "financial_literacy": 0.7,
-                "interest_products": {
-                    "loan": 0.5,
-                    "investment": 0.5,
-                    "deposit": 0.5,
-                    "insurance": 0.5,
-                    "other": 0.5
-                }
-            }"""
+            except (ValueError, ValidationError) as e:
+                print(f"Error generating/parsing persona {i + 1}: {e}")
+                # エラー発生時はフォールバックとしてデフォルトペルソナを追加（ログ出力のみでも可）
+                # ここではログ出力のみとし、リストには追加しない方針も検討可能
+                print(f"Falling back to default persona for {persona_type} {i + 1}")
+
+        return personas
 
     def assign_companies_to_sales(
         self, sales_personas: List[SalesPersona], company_personas: List[CompanyPersona]
     ) -> List[Assignment]:
         """営業担当者に企業を割り当てる"""
         assignments = []
+        # 会社リストが空でないことを確認
+        if not company_personas:
+            print("Warning: No company personas available for assignment.")
+            return []
+
         for sales in sales_personas:
-            num_assigned = random.choice([1, 2])
+            # 割り当てる会社数を会社の総数以下に制限
+            max_assign = min(len(company_personas), 2)
+            num_assigned = random.randint(
+                1, max_assign
+            )  # Use randint for 1 to max_assign inclusive
             assigned_companies = random.sample(company_personas, k=num_assigned)
             assignments.append(
                 Assignment(sales_persona=sales, assigned_companies=assigned_companies)
@@ -240,61 +123,148 @@ class SimulationService:
     ) -> SessionSummary:
         """1回の訪問セッションのシミュレーションを実施"""
         session_history = []
+        current_visit_date = visit_date or datetime.now()
+
         if prev_history:
+            prev_summary = f"""
+            前回の訪問内容：
+            {prev_history}
+            ...
+            """  # （内容は変更なし）
+            session_history.append(SessionHistory(role="system", content=prev_summary))
+
+        # 初回と2回目以降でプロンプトを分岐
+        if session_num == 1:
+            initial_greeting_prompt = f"""
+            以下の情報に基づいて、営業担当者として企業担当者に送る初回メールを生成してください。
+            メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
+
+            営業担当者情報：
+            - 名前：{sales_persona.name}
+            - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+            - 経験年数：{sales_persona.experience_level.value}
+            - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
+
+            企業情報：
+            - 企業名：{company_persona.name}
+            - 業種：{company_persona.industry}
+            - 事業内容：{company_persona.business_description}
+            - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
+
+            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
+
+            初回のメールであることを考慮し、適切な挨拶と自己紹介を含めてください。
+            """
+        else:
+            # 前回のやり取りから商品提案の進捗状況を抽出
+            previous_products = []
+            previous_status = None
+            if session_history:
+                for history in session_history:
+                    if history.product_type:
+                        previous_products.append(history.product_type)
+                    if history.success_score is not None:
+                        previous_status = (
+                            "前向き"
+                            if history.success_score >= 0.7
+                            else "検討中"
+                            if history.success_score >= 0.4
+                            else "消極的"
+                        )
+
+            initial_greeting_prompt = f"""
+            以下の情報に基づいて、営業担当者として企業担当者に送るメールを生成してください。
+            メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
+
+            営業担当者情報：
+            - 名前：{sales_persona.name}
+            - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+            - 経験年数：{sales_persona.experience_level.value}
+            - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
+
+            企業情報：
+            - 企業名：{company_persona.name}
+            - 業種：{company_persona.industry}
+            - 事業内容：{company_persona.business_description}
+            - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
+
+            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
+
+            前回のやり取りの状況：
+            - 提案した商品：{", ".join([p.value for p in previous_products]) if previous_products else "なし"}
+            - 企業様の反応：{previous_status if previous_status else "不明"}
+
+            前回のやり取りを踏まえて、適切なフォローアップと新たな提案を行ってください。
+            前回の提案に対する企業様の反応を考慮し、必要に応じて提案内容を調整してください。
+            """
+
+        try:
+            initial_email = self.openai_client.call_structured_api(
+                [{"role": "user", "content": initial_greeting_prompt}],
+                response_model=EmailMessage,
+                temperature=0.3,
+            )
+            initial_email.sender = sales_persona.name
+            initial_email.recipient = company_persona.name
             session_history.append(
                 SessionHistory(
-                    role="system",
-                    content=(
-                        f"前回の訪問内容を踏まえて、以下の点に注意して会話を進めてください：\n"
-                        f"- 前回の提案に対する企業の反応や懸念点を考慮する\n"
-                        f"- 前回の会話で得られた情報を活かした提案を行う\n"
-                        f"- 前回の訪問から{self.config.visit_interval_days}日が経過していることを考慮する\n"
-                        f"- 企業の状況変化を確認する\n"
-                        f"- 前回の訪問で提案した商品やサービスの進捗状況を確認する\n"
-                        f"- 企業のニーズや課題がどのように変化したかを確認する"
-                    ),
+                    role="assistant",
+                    content=initial_email.format_as_email(),
+                    product_type=initial_email.product_type,
+                    success_score=initial_email.success_score,
                 )
             )
+        except Exception as e:
+            print(f"Error generating initial email: {e}")
+            # エラー時はデフォルトのメールを使用
+            if session_num == 1:
+                default_email = EmailMessage(
+                    subject="ご挨拶と今後のご提案について",
+                    body=f"""
+                    {company_persona.name} 御中
 
-        # 営業担当者の初期挨拶プロンプト
-        initial_greeting_prompt = f"""
-        訪問先：{company_persona.name}
-        訪問日：{visit_date.strftime("%Y年%m月%d日") if visit_date else "本日"}
-        訪問回数：{session_num}回目
-        {"前回の訪問から約1ヶ月が経過しています。" if session_num > 1 else "初回訪問です。"}
+                    平素より大変お世話になっております。
+                    {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}と申します。
 
-        企業情報：
-        - 業種：{company_persona.industry}
-        - 事業内容：{company_persona.business_description}
-        - 従業員数：{company_persona.employee_count}名
-        - 売上規模：{company_persona.annual_sales}
-        - 資金ニーズ：{company_persona.financial_needs}
+                    この度は貴社のご発展を心よりお慶び申し上げます。
+                    つきましては、貴社のご要望に沿った金融商品のご提案をさせていただきたく、
+                    ご連絡させていただきました。
 
-        前回の訪問内容：
-        {prev_history if prev_history else "初回訪問"}
+                    貴社のご要望やご質問がございましたら、メールにて承りますので、
+                    お気軽にご連絡ください。
 
-        以下の点に注意して会話を進めてください：
-        - 企業担当者の性格特性を考慮したコミュニケーションを心がけてください
-        - 企業担当者の意思決定スタイルに合わせた提案を行ってください
-        - 企業担当者のリスク許容度に応じた商品提案をしてください
-        - 企業担当者の金融リテラシーに合わせた説明を行ってください
-        - 企業の具体的な情報を踏まえた提案を行ってください
-        - 企業のニーズに合わせた具体的な商品提案をしてください
-        - {f"前回の訪問内容を踏まえて、企業の反応や懸念点を考慮した提案を行ってください" if session_num > 1 else ""}
-        - {f"前回の訪問から{self.config.visit_interval_days}日が経過していることを考慮してください" if session_num > 1 else ""}
-        - {f"前回の訪問で提案した商品やサービスの進捗状況を確認してください" if session_num > 1 else ""}
-        - {f"企業のニーズや課題がどのように変化したかを確認してください" if session_num > 1 else ""}
-        """
+                    何卒よろしくお願い申し上げます。
+                    """,
+                    sender=sales_persona.name,
+                    recipient=company_persona.name,
+                )
+            else:
+                default_email = EmailMessage(
+                    subject="前回のご提案についてのフォローアップ",
+                    body=f"""
+                    {company_persona.name} 御中
 
-        messages = [
-            {"role": "system", "content": self.prompts.system_prompt_sales_bank},
-            {"role": "user", "content": initial_greeting_prompt},
-        ]
+                    平素より大変お世話になっております。
+                    {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}でございます。
 
-        initial_greeting = self.openai_client.call_chat_api(messages)
-        session_history.append(
-            SessionHistory(role="assistant", content=initial_greeting)
-        )
+                    前回のご提案について、ご検討いただきありがとうございます。
+                    この度は、前回のご提案内容を踏まえまして、より具体的なご提案をさせていただきたく、
+                    ご連絡させていただきました。
+
+                    ご質問やご要望がございましたら、メールにて承りますので、
+                    お気軽にご連絡ください。
+
+                    何卒よろしくお願い申し上げます。
+                    """,
+                    sender=sales_persona.name,
+                    recipient=company_persona.name,
+                )
+            session_history.append(
+                SessionHistory(
+                    role="assistant",
+                    content=default_email.format_as_email(),
+                )
+            )
 
         current_role = "customer"
         attempts = 0
@@ -306,160 +276,178 @@ class SimulationService:
             and final_status == SalesStatus.IN_PROGRESS
         ):
             if current_role == "sales":
-                # 営業担当者の発言
-                messages = [
-                    {"role": "system", "content": self.prompts.system_prompt_sales_bank}
-                ]
-                messages.extend(
-                    [{"role": h.role, "content": h.content} for h in session_history]
-                )
-                response = self.openai_client.call_chat_api(messages)
+                # 営業担当者からのメールを生成
+                sales_email_prompt = f"""
+                以下の会話履歴に基づいて、営業担当者として企業担当者に送るメールを生成してください。
+                メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
 
-                # 提案内容の分析とスコアリング
-                analysis_prompt = f"""
-                以下の営業提案を分析し、以下の情報を厳密にJSON形式で出力してください。
-                他のテキストは一切含めないでください。
-
-                評価基準：
-                - 成功スコア（0.0-1.0）は以下の要素を考慮して決定してください：
-                  * 提案内容が企業のニーズに合致しているか（0.25）
-                  * 提案の具体性と実現可能性（0.20）
-                  * 提案条件の競争力（金利、期間、担保等）（0.15）
-                  * 企業の財務状況との整合性（0.15）
-                  * 企業の反応の予測（0.25）
-
-                - 企業の反応は以下のような要素を考慮して予測してください：
-                  * 提案内容への関心度
-                  * 現在の経営状況との整合性
-                  * 資金調達の緊急性
-                  * 既存の金融機関との関係性
-                  * 市場環境や業界動向との整合性
-                  * 意思決定までの社内プロセス
-                  * 競合他社からの提案状況
-                  * 企業担当者の性格特性
-                  * 企業担当者の意思決定スタイル
-                  * 企業担当者のリスク許容度
-                  * 企業担当者の金融リテラシー
-
-                {{
-                    "product_type": "loan|investment|deposit|insurance|other",
-                    "success_score": 0.0から1.0の数値,
-                    "feedback": "企業の反応の予測（具体的な理由を含めて）"
-                }}
-
-                提案内容：
-                {response}
+                営業担当者情報：
+                - 名前：{sales_persona.name}
+                - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+                - 経験年数：{sales_persona.experience_level.value}
+                - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
 
                 企業情報：
-                {company_persona.json()}
+                - 企業名：{company_persona.name}
+                - 業種：{company_persona.industry}
+                - 事業内容：{company_persona.business_description}
+                - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
 
-                JSONのみを出力してください。
+                会話履歴：
+                {[h.content for h in session_history]}
                 """
 
-                analysis = self.openai_client.call_chat_api(
-                    [{"role": "user", "content": analysis_prompt}],
-                    temperature=0.3,
-                    max_tokens=3000,
-                )
-
                 try:
-                    # JSONの開始と終了を探して抽出
-                    json_start = analysis.find("{")
-                    json_end = analysis.rfind("}") + 1
-                    if json_start != -1 and json_end != -1:
-                        json_str = analysis[json_start:json_end]
-                        # JSONの形式をチェック
-                        if not json_str.strip().startswith(
-                            "{"
-                        ) or not json_str.strip().endswith("}"):
-                            raise json.JSONDecodeError(
-                                "Invalid JSON format", json_str, 0
-                            )
-                        analysis_data = json.loads(json_str)
-                    else:
-                        raise json.JSONDecodeError("No JSON object found", analysis, 0)
+                    sales_email = self.openai_client.call_structured_api(
+                        [{"role": "user", "content": sales_email_prompt}],
+                        response_model=EmailMessage,
+                        temperature=0.3,
+                    )
+                    sales_email.sender = sales_persona.name
+                    sales_email.recipient = company_persona.name
 
-                    # 必須フィールドのチェック
-                    required_fields = ["product_type", "success_score", "feedback"]
-                    for field in required_fields:
-                        if field not in analysis_data:
-                            raise KeyError(f"Missing required field: {field}")
+                    # 提案内容の分析
+                    analysis_messages = [
+                        {
+                            "role": "system",
+                            "content": """
+                            以下の営業提案を分析し、企業の反応を予測してください。
+                            分析結果は必ず指定されたJSONスキーマに準拠した形式で返してください。
+                            """,
+                        },
+                        {
+                            "role": "user",
+                            "content": f"""
+                            提案内容：
+                            {sales_email.body}
 
-                    # 型チェック
-                    if not isinstance(analysis_data["success_score"], (int, float)):
-                        raise ValueError("success_score must be a number")
-                    if not isinstance(analysis_data["product_type"], str):
-                        raise ValueError("product_type must be a string")
-                    if not isinstance(analysis_data["feedback"], str):
-                        raise ValueError("feedback must be a string")
+                            企業情報：
+                            {company_persona.model_dump_json()}
 
-                    product_type = ProductType(analysis_data["product_type"])
-                    success_score = float(analysis_data["success_score"])
+                            前回のやり取り：
+                            {[h.content for h in session_history]}
 
-                    # 営業担当者の経験値と性格特性によるスコア調整
-                    success_score *= sales_persona.calculate_success_rate()
+                            前回のやり取りを踏まえて、以下の点を分析してください：
+                            - 今回の提案が前回のやり取りとどのように関連しているか
+                            - 企業の反応が前回のやり取りからどのように変化しているか
+                            - 提案の進捗状況と今後の見通し
+                            """,
+                        },
+                    ]
+
+                    analysis_data = self.openai_client.call_structured_api(
+                        analysis_messages,
+                        response_model=ProposalAnalysis,
+                        temperature=0.3,
+                    )
+
+                    sales_email.product_type = analysis_data.product_type
+                    sales_email.success_score = (
+                        analysis_data.success_score
+                        * sales_persona.calculate_success_rate()
+                    )
 
                     session_history.append(
                         SessionHistory(
                             role="assistant",
-                            content=response,
-                            product_type=product_type,
-                            success_score=success_score,
+                            content=sales_email.format_as_email(),
+                            product_type=sales_email.product_type,
+                            success_score=sales_email.success_score,
                         )
                     )
 
-                    if success_score >= self.config.min_success_score:  # 0.75以上で成功
-                        matched_products.append(product_type)
+                    if sales_email.success_score >= self.config.min_success_score:
+                        matched_products.append(sales_email.product_type)
                         final_status = SalesStatus.SUCCESS
-                    elif success_score < 0.4:  # 0.4未満で失敗
+                    elif sales_email.success_score < 0.4:
                         final_status = SalesStatus.FAILED
-                    else:  # 0.4-0.75はPENDING
+                    else:
                         final_status = SalesStatus.PENDING
 
                     attempts += 1
-                except (json.JSONDecodeError, KeyError, ValueError) as e:
-                    print(f"Error analyzing proposal: {e}")
-                    print(f"Raw analysis response: {analysis}")
-                    # エラー時はデフォルト値を使用
-                    session_history.append(
-                        SessionHistory(
-                            role="assistant",
-                            content=response,
-                            product_type=ProductType.OTHER,
-                            success_score=0.5,
-                        )
-                    )
+
+                except Exception as e:
+                    print(f"Error generating sales email: {e}")
                     final_status = SalesStatus.PENDING
                     attempts += 1
 
                 current_role = "customer"
             else:
-                # 顧客企業の担当者の発言
-                messages = [
-                    {
-                        "role": "system",
-                        "content": self.prompts.system_prompt_customer_bank,
-                    }
-                ]
-                messages.extend(
-                    [{"role": h.role, "content": h.content} for h in session_history]
-                )
+                # 企業担当者からのメールを生成
+                customer_email_prompt = f"""
+                以下の情報に基づいて、企業担当者として営業担当者に送るメールを生成してください。
+                メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
 
-                response = self.openai_client.call_chat_api(messages)
-                session_history.append(
-                    SessionHistory(role="assistant", content=response)
-                )
+                企業情報：
+                - 企業名：{company_persona.name}
+                - 業種：{company_persona.industry}
+                - 事業内容：{company_persona.business_description}
+                - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
+                - 意思決定スタイル：{company_persona.decision_making_style}
+                - リスク許容度：{company_persona.risk_tolerance}
+                - 金融リテラシー：{company_persona.financial_literacy}
+
+                営業担当者情報：
+                - 名前：{sales_persona.name}
+                - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+                - 経験年数：{sales_persona.experience_level.value}
+                - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
+
+                会話履歴：
+                {[h.content for h in session_history]}
+
+                前回のやり取りを踏まえて、適切な返信を行ってください。
+                営業担当者の提案に対する反応は、あなたの性格特性、意思決定スタイル、リスク許容度、金融リテラシーを反映してください。
+                すべてのやり取りはメールのみで完結させ、訪問や面談に関する言及は避けてください。
+                メールでの質問や要望は十分に詳細に行ってください。
+                """
+
+                try:
+                    customer_email = self.openai_client.call_structured_api(
+                        [{"role": "user", "content": customer_email_prompt}],
+                        response_model=EmailMessage,
+                        temperature=0.3,
+                    )
+                    customer_email.sender = company_persona.name
+                    customer_email.recipient = sales_persona.name
+
+                    session_history.append(
+                        SessionHistory(
+                            role="assistant",
+                            content=customer_email.format_as_email(),
+                        )
+                    )
+                except Exception as e:
+                    print(f"Error generating customer email: {e}")
+                    # エラー時はデフォルトのメールを使用
+                    default_customer_email = EmailMessage(
+                        subject="ご提案について",
+                        body=f"""
+                        {sales_persona.name} 様
+
+                        ご連絡ありがとうございます。
+                        ご提案いただいた内容について、社内で検討させていただきます。
+
+                        何卒よろしくお願い申し上げます。
+                        """,
+                        sender=company_persona.name,
+                        recipient=sales_persona.name,
+                    )
+                    session_history.append(
+                        SessionHistory(
+                            role="assistant",
+                            content=default_customer_email.format_as_email(),
+                        )
+                    )
+
                 current_role = "sales"
 
-        # SessionHistoryオブジェクトを辞書に変換
         history_dicts = [h.to_dict() for h in session_history]
 
         return SessionSummary(
             session_num=session_num,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            visit_date=visit_date.strftime("%Y-%m-%d")
-            if visit_date
-            else datetime.now().strftime("%Y-%m-%d"),
+            visit_date=current_visit_date.strftime("%Y-%m-%d"),
             history=history_dicts,
             final_status=final_status,
             matched_products=matched_products,
@@ -472,17 +460,20 @@ class SimulationService:
         company_persona: CompanyPersona,
     ) -> MeetingLog:
         """訪問記録を生成する"""
+        # メールの履歴から訪問内容を抽出
+        email_history = []
+        for history in session_summary.history:
+            if "件名:" in history.content:
+                email_history.append(history.content)
+
         # 営業担当者目線での報告書生成用プロンプト
         report_prompt = f"""
         訪問先：{company_persona.name}
         訪問日：{session_summary.visit_date}
         訪問回数：{session_summary.session_num}回目
 
-        前回の訪問内容：
-        {session_summary.history[-2].content if len(session_summary.history) > 1 else "初回訪問"}
-
-        本日の訪問内容：
-        {session_summary.history[-1].content}
+        メールのやり取り：
+        {chr(10).join(email_history)}
 
         商品提案の進捗：
         {", ".join([p.value for p in session_summary.matched_products]) if session_summary.matched_products else "提案中"}

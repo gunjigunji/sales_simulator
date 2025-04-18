@@ -28,34 +28,46 @@ def save_results(results_dict, timestamp):
 def format_conversation_history(history):
     """対話履歴を整形して返す"""
     formatted_history = []
+    current_role = "営業担当"  # 最初のメールは必ず営業担当から
+
     for entry in history:
         # システムメッセージはスキップ
         if entry.role == "system":
             continue
 
-        # 役割の判定を改善
-        if entry.role == "assistant":
-            # メッセージの内容から役割を判定
-            if "【営業担当ペルソナ】" in entry.content:
-                role = "営業担当"
-            elif "【企業ペルソナ】" in entry.content:
-                role = "企業担当"
-            else:
-                # 直前の役割に基づいて判定（交互に）
+        # メール形式のメッセージを処理
+        if "件名:" in entry.content:
+            # メールの本文を抽出
+            content_lines = entry.content.split("\n")
+            body_start = next(
+                i for i, line in enumerate(content_lines) if line.strip() == ""
+            )
+            content = "\n".join(content_lines[body_start:]).strip()
+
+            formatted_history.append({"role": current_role, "content": content})
+
+            # 役割を交互に切り替え
+            current_role = "企業担当" if current_role == "営業担当" else "営業担当"
+        else:
+            # 非メール形式のメッセージは従来通り処理
+            if entry.role == "assistant":
                 if formatted_history and formatted_history[-1]["role"] == "営業担当":
                     role = "企業担当"
                 else:
                     role = "営業担当"
-        else:
-            # userの場合は企業担当
-            role = "企業担当"
+                formatted_history.append({"role": role, "content": entry.content})
+            elif entry.role == "user":
+                content = entry.content.strip()
+                if content:
+                    if (
+                        formatted_history
+                        and formatted_history[-1]["role"] == "営業担当"
+                    ):
+                        role = "企業担当"
+                    else:
+                        role = "営業担当"
+                    formatted_history.append({"role": role, "content": content})
 
-        content = (
-            entry.content.replace("【営業担当ペルソナ】", "")
-            .replace("【企業ペルソナ】", "")
-            .strip()
-        )
-        formatted_history.append({"role": role, "content": content})
     return formatted_history
 
 
