@@ -2,9 +2,10 @@ import json
 import os
 from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, cast
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, ValidationError
 
+from src.exceptions import APIError, ConfigurationError
 from src.models.settings import SimulationConfig
 
 T = TypeVar("T", bound=BaseModel)
@@ -13,9 +14,16 @@ T = TypeVar("T", bound=BaseModel)
 class OpenAIClient:
     def __init__(self, config: SimulationConfig):
         self.config = config
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        if not os.getenv("OPENAI_API_KEY"):
-            raise ValueError("OPENAI_API_KEY environment variable is not set")
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ConfigurationError(
+                "OPENAI_API_KEY environment variable is not set. "
+                "Please set your OpenAI API key in the environment variables."
+            )
+        try:
+            self.client = OpenAI(api_key=api_key)
+        except Exception as e:
+            raise ConfigurationError(f"Failed to initialize OpenAI client: {str(e)}")
 
     def call_chat_api(
         self,
@@ -35,6 +43,9 @@ class OpenAIClient:
 
         Returns:
             APIからの応答テキスト
+
+        Raises:
+            APIError: API呼び出しに失敗した場合
         """
         try:
             response = self.client.chat.completions.create(
@@ -44,10 +55,14 @@ class OpenAIClient:
                 max_tokens=max_tokens or self.config.max_tokens,
             )
             return response.choices[0].message.content.strip()
+        except OpenAIError as e:
+            error_message = f"OpenAI API call failed: {str(e)}"
+            print(error_message)
+            raise APIError(error_message) from e
         except Exception as e:
-            # より具体的なエラーハンドリングが必要な場合は修正
-            print(f"Error calling OpenAI API: {e}")
-            raise Exception(f"OpenAI API call failed: {str(e)}") from e
+            error_message = f"Unexpected error during API call: {str(e)}"
+            print(error_message)
+            raise APIError(error_message) from e
 
     def call_structured_api(
         self,

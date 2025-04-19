@@ -1,10 +1,11 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from src.models.persona import (
-    CustomerPersonalityTrait,
+from src.models.evaluation import (
     EvaluationCriteria,
     EvaluationResult,
+    InterestLevel,
+    InterestScore,
     Proposal,
 )
 
@@ -18,13 +19,15 @@ class ProposalEvaluator:
         financial_literacy: float,
         annual_sales: str,
         industry: str,
-        personality_traits: List[CustomerPersonalityTrait],
+        personality_traits: List[str],
+        interest_products: Optional[Dict[str, float]] = None,
     ):
         self.risk_tolerance = risk_tolerance
         self.financial_literacy = financial_literacy
         self.annual_sales = annual_sales
         self.industry = industry
         self.personality_traits = personality_traits
+        self.interest_products = interest_products or {}
 
     def evaluate_proposal(self, proposal: Proposal) -> EvaluationResult:
         """提案内容を評価し、判断を行う"""
@@ -49,6 +52,102 @@ class ProposalEvaluator:
                 required_info=self._identify_required_information(proposal),
                 evaluation_date=datetime.now(),
             )
+
+    def calculate_interest_score(
+        self,
+        message_content: str,
+        product_type: Optional[str] = None,
+    ) -> InterestScore:
+        """メッセージ内容から興味度スコアを計算"""
+        base_score = 50.0
+        factors: Dict[str, Any] = {}
+
+        # 性格特性による調整
+        trait_multiplier = 1.0
+        for trait in self.personality_traits:
+            if trait == "cooperative":
+                trait_multiplier *= 1.2
+                factors["cooperative_trait"] = 1.2
+            elif trait == "skeptical":
+                trait_multiplier *= 0.8
+                factors["skeptical_trait"] = 0.8
+            elif trait == "analytical":
+                trait_multiplier *= 0.9
+                factors["analytical_trait"] = 0.9
+
+        # 商品タイプごとの興味度による調整
+        if product_type and product_type in self.interest_products:
+            product_interest = self.interest_products[product_type]
+            base_score *= 0.5 + product_interest
+            factors["product_interest"] = 0.5 + product_interest
+
+        # メッセージ内容による調整
+        content_score = self._analyze_message_content(message_content)
+        base_score += content_score
+        factors["content_analysis"] = content_score / 10
+
+        # 最終スコアの計算と制限
+        final_score = min(100.0, max(0.0, base_score * trait_multiplier))
+
+        # 興味レベルの判定
+        interest_level = self._determine_interest_level(final_score)
+
+        return InterestScore(
+            score=final_score,
+            product_type=product_type,
+            level=interest_level,
+            factors=factors,
+            timestamp=datetime.now().isoformat(),
+        )
+
+    def _analyze_message_content(self, message_content: str) -> float:
+        """メッセージ内容を分析してスコアを計算"""
+        positive_keywords = [
+            "ご検討",
+            "興味",
+            "詳細",
+            "ご提案",
+            "承知",
+            "ありがとう",
+            "期待",
+            "前向き",
+        ]
+        negative_keywords = [
+            "結構です",
+            "見送り",
+            "他社",
+            "予算",
+            "時期",
+            "難しい",
+            "検討中",
+            "保留",
+        ]
+
+        content_score = 0
+        positive_weight = 5.0
+        negative_weight = -5.0
+
+        for keyword in positive_keywords:
+            if keyword in message_content:
+                content_score += positive_weight
+        for keyword in negative_keywords:
+            if keyword in message_content:
+                content_score += negative_weight
+
+        return content_score
+
+    def _determine_interest_level(self, score: float) -> InterestLevel:
+        """スコアから興味レベルを判定"""
+        if score >= 80:
+            return InterestLevel.VERY_HIGH
+        elif score >= 60:
+            return InterestLevel.HIGH
+        elif score >= 40:
+            return InterestLevel.MODERATE
+        elif score >= 20:
+            return InterestLevel.LOW
+        else:
+            return InterestLevel.VERY_LOW
 
     def _calculate_evaluation_scores(self, proposal: Proposal) -> Dict[str, float]:
         """提案内容の各評価基準に対するスコアを計算"""
@@ -262,9 +361,9 @@ class ProposalEvaluator:
         final_score = avg_score * (1 - concern_weight) * criteria_met_ratio
 
         # 性格特性による調整
-        if CustomerPersonalityTrait.CAUTIOUS in self.personality_traits:
+        if "cautious" in self.personality_traits:
             final_score *= 0.9
-        if CustomerPersonalityTrait.COOPERATIVE in self.personality_traits:
+        if "cooperative" in self.personality_traits:
             final_score *= 1.1
 
         # 判断
@@ -302,3 +401,15 @@ class ProposalEvaluator:
             required_info.append("同業種での導入実績")
 
         return required_info
+
+    @classmethod
+    def from_company_persona(cls, company_persona: Any) -> "ProposalEvaluator":
+        """CompanyPersonaからProposalEvaluatorを生成"""
+        return cls(
+            risk_tolerance=company_persona.risk_tolerance,
+            financial_literacy=company_persona.financial_literacy,
+            annual_sales=company_persona.annual_sales,
+            industry=company_persona.industry,
+            personality_traits=company_persona.personality_traits,
+            interest_products=company_persona.interest_products,
+        )

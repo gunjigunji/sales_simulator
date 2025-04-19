@@ -1,11 +1,37 @@
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from src.models.settings import SimulationConfig  # 設定ファイルのインポート
+from src.models.evaluation import (
+    EvaluationCriteria,
+    EvaluationResult,
+    InterestLevel,
+    InterestScore,
+    Proposal,
+)
+from src.models.settings import SimulationConfig
+from src.services.evaluation_service import ProposalEvaluator
+from src.services.openai_client import OpenAIClient
+
+
+class InterestScoreResponse(BaseModel):
+    """LLMからの興味度評価レスポンスを構造化するモデル"""
+
+    interest_score: float = Field(ge=0.0, le=100.0, description="興味度スコア（0-100）")
+    reasoning: str = Field(description="スコア評価の理由説明")
+    key_factors: List[str] = Field(description="評価に考慮した主な要因のリスト")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "interest_score": 75.5,
+                "reasoning": "提案内容が企業のニーズと合致しており、具体的な数値も示されている",
+                "key_factors": ["ニーズとの適合性", "提案の具体性", "実現可能性"],
+            }
+        }
 
 
 class SalesStatus(str, Enum):
@@ -70,16 +96,6 @@ class RejectionReason(str, Enum):
     FEATURE_MISMATCH = "feature_mismatch"  # 機能のミスマッチ
 
 
-class InterestLevel(str, Enum):
-    """提案への興味レベル"""
-
-    VERY_HIGH = "very_high"  # 非常に興味あり（スコア: 80-100）
-    HIGH = "high"  # 興味あり（スコア: 60-79）
-    MODERATE = "moderate"  # やや興味あり（スコア: 40-59）
-    LOW = "low"  # あまり興味なし（スコア: 20-39）
-    VERY_LOW = "very_low"  # 全く興味なし（スコア: 0-19）
-
-
 class ResponseType(str, Enum):
     """メールの応答タイプ"""
 
@@ -92,67 +108,37 @@ class ResponseType(str, Enum):
     ACCEPTANCE = "acceptance"  # 提案受諾
 
 
-class InterestScore(BaseModel):
-    """興味度スコアモデル"""
-
-    score: float = Field(ge=0.0, le=100.0)  # 総合スコア
-    product_type: Optional[ProductType] = None  # 対象商品タイプ
-    level: InterestLevel  # 興味レベル
-    factors: Dict[str, float] = Field(default_factory=dict)  # スコアに影響を与えた要因
-    timestamp: str = Field(
-        default_factory=lambda: datetime.now().isoformat()
-    )  # 評価時刻をstr型で保存
-
-    @classmethod
-    def model_validate(cls, value, **kwargs):
-        if isinstance(value, dict) and (
-            "timestamp" not in value or not value["timestamp"]
-        ):
-            value["timestamp"] = datetime.now().isoformat()
-        return super().model_validate(value, **kwargs)
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-        arbitrary_types_allowed = True
-
-    def calculate_level(self) -> InterestLevel:
-        """スコアから興味レベルを計算"""
-        if self.score >= 80:
-            return InterestLevel.VERY_HIGH
-        elif self.score >= 60:
-            return InterestLevel.HIGH
-        elif self.score >= 40:
-            return InterestLevel.MODERATE
-        elif self.score >= 20:
-            return InterestLevel.LOW
-        else:
-            return InterestLevel.VERY_LOW
-
-
 class ConversationContext(BaseModel):
     """会話コンテキスト管理モデル"""
 
-    last_contact_date: Optional[str] = None  # 最終接触日をstr型で保存
-    discussed_topics: List[str] = Field(default_factory=list)
-    promised_actions: List[str] = Field(default_factory=list)
-    interest_history: List[InterestScore] = Field(default_factory=list)
-    rejection_history: List[RejectionReason] = Field(default_factory=list)
+    last_contact_date: Optional[str] = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="最終接触日"
+    )
+    discussed_topics: List[str] = Field(
+        default_factory=list, description="議論されたトピックのリスト"
+    )
+    promised_actions: List[str] = Field(
+        default_factory=list, description="約束された行動のリスト"
+    )
+    interest_history: List[InterestScore] = Field(
+        default_factory=list, description="興味度の履歴"
+    )
+    rejection_history: List[RejectionReason] = Field(
+        default_factory=list, description="拒否理由の履歴"
+    )
     product_discussions: Dict[ProductType, List[str]] = Field(
-        default_factory=dict
-    )  # 日時をstr型で保存
+        default_factory=lambda: {pt: [] for pt in ProductType},
+        description="商品タイプごとの議論履歴",
+    )
 
-    @classmethod
-    def model_validate(cls, value, **kwargs):
-        if isinstance(value, dict):
-            if "last_contact_date" not in value or not value["last_contact_date"]:
-                value["last_contact_date"] = datetime.now().isoformat()
-            if "product_discussions" in value:
-                for product_type in value["product_discussions"]:
-                    value["product_discussions"][product_type] = [
-                        d.isoformat() if isinstance(d, datetime) else d
-                        for d in value["product_discussions"][product_type]
-                    ]
-        return super().model_validate(value, **kwargs)
+    class Config:
+        arbitrary_types_allowed = True
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # 商品タイプごとの議論履歴の初期化を確実に行う
+        if not self.product_discussions:
+            self.product_discussions = {pt: [] for pt in ProductType}
 
     def cleanup_old_records(self, retention_visits: int = 3):
         """古い記録を削除"""
@@ -292,7 +278,7 @@ class SalesPersona(BasePersona):
         return min(1.0, max(0.0, success_rate))
 
 
-class CompanyContactPersona(BaseModel):
+class CompanyContactPersona(BasePersona):
     """企業担当者のペルソナ"""
 
     name: str
@@ -371,17 +357,6 @@ class NegotiationStage(str, Enum):
     DETAILED_REVIEW = "detailed_review"  # 詳細検討段階
     FINAL_EVALUATION = "final_evaluation"  # 最終評価段階
     DECISION_MAKING = "decision_making"  # 意思決定段階
-
-
-class EvaluationCriteria(str, Enum):
-    """評価基準を表す列挙型"""
-
-    COST = "cost"  # コスト面
-    RISK = "risk"  # リスク面
-    BENEFIT = "benefit"  # メリット面
-    FEASIBILITY = "feasibility"  # 実現可能性
-    SUPPORT = "support"  # サポート体制
-    TRACK_RECORD = "track_record"  # 実績
 
 
 class NegotiationProgress(BaseModel):
@@ -467,40 +442,6 @@ class DecisionMaking(BaseModel):
                 "decision_date": datetime.now().isoformat(),
             }
         }
-
-
-class EvaluationResult(BaseModel):
-    """提案評価結果モデル"""
-
-    decision: str
-    scores: Dict[str, float]
-    concerns: List[str]
-    required_info: Optional[List[str]] = None
-    evaluation_date: datetime = Field(default_factory=datetime.now)
-
-    @classmethod
-    def model_validate(cls, value, **kwargs):
-        if isinstance(value, dict) and (
-            "evaluation_date" not in value or not value["evaluation_date"]
-        ):
-            value["evaluation_date"] = datetime.now().isoformat()
-        return super().model_validate(value, **kwargs)
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-        arbitrary_types_allowed = True
-
-
-class Proposal(BaseModel):
-    """提案内容モデル"""
-
-    product_type: ProductType
-    terms: Dict[str, Any]
-    benefits: List[str]
-    risks: List[str]
-    cost_information: Dict[str, Any]
-    support_details: Dict[str, Any]
-    track_record: List[Dict[str, Any]]
 
 
 class CompanyPersona(BasePersona):
@@ -631,108 +572,209 @@ class CompanyPersona(BasePersona):
             }
         }
 
-    def calculate_interest_score(
+    def __init__(self, **data):
+        super().__init__(**data)
+        # 会話コンテキストの初期化を確実に行う
+        if not hasattr(self, "conversation_context"):
+            self.conversation_context = ConversationContext()
+        # 興味度スコアの初期化
+        if not hasattr(self, "current_interest_score"):
+            self.current_interest_score = InterestScore(
+                score=50.0,
+                level=InterestLevel.MODERATE,
+                factors={},
+            )
+        # 商品への興味度の初期化
+        if not hasattr(self, "interest_products"):
+            self.interest_products = {product_type: 0.5 for product_type in ProductType}
+
+    def validate_product_type(
+        self, product_type: Optional[ProductType]
+    ) -> Optional[ProductType]:
+        """
+        商品タイプの妥当性を検証
+
+        Args:
+            product_type: 検証する商品タイプ
+
+        Returns:
+            検証済みの商品タイプ、または None
+
+        Raises:
+            ValueError: 無効な商品タイプの場合
+        """
+        if product_type is None:
+            return None
+        try:
+            return ProductType(product_type.value)
+        except ValueError:
+            print(f"Warning: Invalid product type {product_type}, defaulting to None")
+            return None
+
+    def calculate_interest_score_with_llm(
+        self,
+        message_content: str,
+        product_type: Optional[ProductType] = None,
+        config: Optional[SimulationConfig] = None,
+        openai_client: Optional[OpenAIClient] = None,
+    ) -> InterestScore:
+        """LLMを使用してメッセージ内容から興味度スコアを計算"""
+        if not openai_client:
+            raise ValueError("OpenAI client is required for LLM-based scoring")
+
+        # 商品タイプの検証
+        validated_product_type = self.validate_product_type(product_type)
+
+        try:
+            # 企業担当者の視点でメッセージを評価するためのプロンプト
+            prompt = f"""
+            あなたは以下の特性を持つ企業の担当者です：
+
+            企業情報：
+            - 企業名：{self.name}
+            - 業種：{self.industry}
+            - 事業内容：{self.business_description}
+            - 規模：従業員数{self.employee_count}名、売上{self.annual_sales}
+            - 資金ニーズ：{self.financial_needs}
+
+            あなたの特性：
+            - 役職：{self.contact_person.position if self.contact_person else "不明"}
+            - 性格：{", ".join([trait.value for trait in self.personality_traits])}
+            - 意思決定スタイル：{self.decision_making_style}
+            - リスク許容度：{self.risk_tolerance}
+            - 金融リテラシー：{self.financial_literacy}
+
+            以下の営業担当者からのメッセージに対する、あなたの興味度を0から100の数値で評価してください。
+            評価の際は以下の要素を考慮してください：
+            - メッセージの内容と自社のニーズとの適合性
+            - 提案内容の具体性と実現可能性
+            - 自社の状況との整合性
+            - あなたの性格や意思決定スタイルとの相性
+
+            商品タイプ：{validated_product_type.value if validated_product_type else "不明"}
+
+            メッセージ内容：
+            {message_content}
+
+            以下のJSON形式で回答してください：
+            {{
+                "interest_score": 数値（0-100）,
+                "reasoning": "スコアの理由の説明",
+                "key_factors": ["考慮した主な要因をリストで"]
+            }}
+            """
+
+            # LLMからの応答を取得
+            try:
+                response = openai_client.call_structured_api(
+                    messages=[{"role": "user", "content": prompt}],
+                    response_model=InterestScoreResponse,
+                    temperature=0.3,  # 一貫性のために低めの温度を設定
+                )
+            except Exception as api_error:
+                print(f"Error calling OpenAI API: {api_error}")
+                raise
+
+            # InterestScoreオブジェクトの作成
+            try:
+                factors = {
+                    f"factor_{i}": factor
+                    for i, factor in enumerate(response.key_factors)
+                }
+                factors["llm_reasoning"] = response.reasoning
+
+                interest_score = InterestScore(
+                    score=response.interest_score,
+                    product_type=validated_product_type,
+                    level=self._determine_interest_level(
+                        response.interest_score, config
+                    ),
+                    factors=factors,
+                    timestamp=datetime.now().isoformat(),
+                )
+
+                # 履歴の更新
+                self.current_interest_score = interest_score
+                self.conversation_context.interest_history.append(interest_score)
+
+                return interest_score
+
+            except Exception as processing_error:
+                print(f"Error processing LLM response: {processing_error}")
+                raise
+
+        except Exception as e:
+            print(f"Error in LLM-based scoring: {e}")
+            return self.calculate_interest_score_keyword_based(
+                message_content, validated_product_type, config
+            )
+
+    def calculate_interest_score_keyword_based(
         self,
         message_content: str,
         product_type: Optional[ProductType] = None,
         config: Optional[SimulationConfig] = None,
     ) -> InterestScore:
-        """メッセージ内容から興味度スコアを計算"""
-        base_score = 50.0  # 基本スコア
-        factors = {}
-
-        # デフォルトの重み付け値を設定
-        positive_weight = 5.0
-        negative_weight = -5.0
-        if config and config.keyword_weights:
-            positive_weight = config.keyword_weights.get("positive", 5.0)
-            negative_weight = config.keyword_weights.get("negative", -5.0)
-
-        # 性格特性による調整
-        trait_multiplier = 1.0
-        for trait in self.personality_traits:
-            if trait == CustomerPersonalityTrait.COOPERATIVE:
-                trait_multiplier *= 1.2
-                factors["cooperative_trait"] = 1.2
-            elif trait == CustomerPersonalityTrait.SKEPTICAL:
-                trait_multiplier *= 0.8
-                factors["skeptical_trait"] = 0.8
-            elif trait == CustomerPersonalityTrait.ANALYTICAL:
-                trait_multiplier *= 0.9
-                factors["analytical_trait"] = 0.9
-
-        # 商品タイプごとの興味度による調整
-        if product_type and product_type in self.interest_products:
-            product_interest = self.interest_products[product_type]
-            base_score *= 0.5 + product_interest
-            factors["product_interest"] = 0.5 + product_interest
-
-        # メッセージ内容による調整
-        positive_keywords = [
-            "ご検討",
-            "興味",
-            "詳細",
-            "ご提案",
-            "承知",
-            "ありがとう",
-            "期待",
-            "前向き",
-        ]
-        negative_keywords = [
-            "結構です",
-            "見送り",
-            "他社",
-            "予算",
-            "時期",
-            "難しい",
-            "検討中",
-            "保留",
-        ]
-
-        content_score = 0
-        for keyword in positive_keywords:
-            if keyword in message_content:
-                content_score += positive_weight
-        for keyword in negative_keywords:
-            if keyword in message_content:
-                content_score += negative_weight
-
-        base_score += content_score
-        factors["content_analysis"] = content_score / 10
-
-        # 最終スコアの計算と制限
-        final_score = min(100.0, max(0.0, base_score * trait_multiplier))
-
-        # InterestScoreオブジェクトの作成
-        interest_score = InterestScore(
-            score=final_score,
-            product_type=product_type,
-            level=InterestLevel.MODERATE,  # 仮の値、calculate_levelで更新
-            factors=factors,
-            timestamp=datetime.now().isoformat(),
+        """キーワードベースで興味度スコアを計算（従来の実装）"""
+        evaluator = ProposalEvaluator(
+            risk_tolerance=self.risk_tolerance,
+            financial_literacy=self.financial_literacy,
+            annual_sales=self.annual_sales,
+            industry=self.industry,
+            personality_traits=[trait.value for trait in self.personality_traits],
+            interest_products={
+                pt.value: score for pt, score in self.interest_products.items()
+            },
         )
 
-        # 興味レベルの判定（設定パラメータを使用）
-        if config and config.interest_score_thresholds:
-            thresholds = config.interest_score_thresholds
-            if final_score >= thresholds.get("very_high", 80.0):
-                interest_score.level = InterestLevel.VERY_HIGH
-            elif final_score >= thresholds.get("high", 60.0):
-                interest_score.level = InterestLevel.HIGH
-            elif final_score >= thresholds.get("moderate", 40.0):
-                interest_score.level = InterestLevel.MODERATE
-            elif final_score >= thresholds.get("low", 20.0):
-                interest_score.level = InterestLevel.LOW
-            else:
-                interest_score.level = InterestLevel.VERY_LOW
-        else:
-            interest_score.level = interest_score.calculate_level()
+        product_type_str = product_type.value if product_type else None
+        interest_score = evaluator.calculate_interest_score(
+            message_content, product_type_str
+        )
+
+        # InterestScoreをProductTypeを使用する形式に変換
+        converted_score = InterestScore(
+            score=interest_score.score,
+            product_type=ProductType(interest_score.product_type)
+            if interest_score.product_type
+            else None,
+            level=interest_score.level,
+            factors=interest_score.factors,
+            timestamp=interest_score.timestamp,
+        )
 
         # 履歴の更新
-        self.current_interest_score = interest_score
-        self.conversation_context.interest_history.append(interest_score)
+        self.current_interest_score = converted_score
+        self.conversation_context.interest_history.append(converted_score)
 
-        return interest_score
+        return converted_score
+
+    def calculate_interest_score(
+        self,
+        message_content: str,
+        product_type: Optional[ProductType] = None,
+        config: Optional[SimulationConfig] = None,
+        openai_client: Optional[OpenAIClient] = None,
+    ) -> InterestScore:
+        """
+        メッセージ内容から興味度スコアを計算
+        LLMベースの評価を優先し、エラー時にキーワードベースにフォールバック
+        """
+        try:
+            if openai_client:
+                return self.calculate_interest_score_with_llm(
+                    message_content, product_type, config, openai_client
+                )
+            else:
+                return self.calculate_interest_score_keyword_based(
+                    message_content, product_type, config
+                )
+        except Exception as e:
+            print(f"Error in interest score calculation: {e}")
+            # 最終的なフォールバック：キーワードベース評価
+            return self.calculate_interest_score_keyword_based(
+                message_content, product_type, config
+            )
 
     def determine_response_type(
         self,
@@ -969,311 +1011,54 @@ class CompanyPersona(BasePersona):
 
     def evaluate_proposal(self, proposal: Proposal) -> EvaluationResult:
         """提案内容を評価し、判断を行う"""
-        # 評価基準に基づくスコアリング
-        scores = self._calculate_evaluation_scores(proposal)
+        evaluator = ProposalEvaluator(
+            risk_tolerance=self.risk_tolerance,
+            financial_literacy=self.financial_literacy,
+            annual_sales=self.annual_sales,
+            industry=self.industry,
+            personality_traits=[trait.value for trait in self.personality_traits],
+            interest_products={
+                pt.value: score for pt, score in self.interest_products.items()
+            },
+        )
+        return evaluator.evaluate_proposal(proposal)
 
-        # 懸念事項の確認
-        concerns = self._identify_remaining_concerns(proposal)
+    def _determine_interest_level(
+        self, score: float, config: Optional[SimulationConfig] = None
+    ) -> InterestLevel:
+        """
+        スコアから興味レベルを判定
 
-        # 判断基準の充足確認
-        criteria_met = self._check_decision_criteria(proposal)
+        Args:
+            score (float): 興味度スコア（0-100）
+            config (Optional[SimulationConfig]): シミュレーション設定
 
-        # 最終判断
-        if self._is_ready_for_decision(scores, concerns, criteria_met):
-            decision = self._make_final_decision(scores, concerns, criteria_met)
-            return EvaluationResult(
-                decision=decision, scores=scores, concerns=concerns, required_info=None
-            )
-        else:
-            return EvaluationResult(
-                decision="pending",
-                scores=scores,
-                concerns=concerns,
-                required_info=self._identify_required_information(proposal),
-            )
-
-    def _calculate_evaluation_scores(self, proposal: Proposal) -> Dict[str, float]:
-        """提案内容の各評価基準に対するスコアを計算"""
-        scores = {}
-
-        # コスト評価
-        cost_score = self._evaluate_cost(proposal.cost_information)
-        scores[EvaluationCriteria.COST.value] = cost_score
-
-        # リスク評価
-        risk_score = self._evaluate_risk(proposal.risks)
-        scores[EvaluationCriteria.RISK.value] = risk_score
-
-        # メリット評価
-        benefit_score = self._evaluate_benefits(proposal.benefits)
-        scores[EvaluationCriteria.BENEFIT.value] = benefit_score
-
-        # 実現可能性評価
-        feasibility_score = self._evaluate_feasibility(proposal)
-        scores[EvaluationCriteria.FEASIBILITY.value] = feasibility_score
-
-        # サポート体制評価
-        support_score = self._evaluate_support(proposal.support_details)
-        scores[EvaluationCriteria.SUPPORT.value] = support_score
-
-        # 実績評価
-        track_record_score = self._evaluate_track_record(proposal.track_record)
-        scores[EvaluationCriteria.TRACK_RECORD.value] = track_record_score
-
-        return scores
-
-    def _evaluate_cost(self, cost_info: Dict[str, Any]) -> float:
-        """コスト面の評価を行う"""
-        # リスク許容度と金融リテラシーを考慮した評価
-        base_score = 0.5
-
-        if "total_cost" in cost_info:
-            cost_ratio = cost_info["total_cost"] / float(self.annual_sales)
-            if cost_ratio < 0.01:  # コストが年商の1%未満
-                base_score += 0.3
-            elif cost_ratio < 0.05:  # コストが年商の5%未満
-                base_score += 0.1
+        Returns:
+            InterestLevel: 判定された興味レベル
+        """
+        if config and config.interest_score_thresholds:
+            thresholds = config.interest_score_thresholds
+            if score >= thresholds.get("very_high", 80.0):
+                return InterestLevel.VERY_HIGH
+            elif score >= thresholds.get("high", 60.0):
+                return InterestLevel.HIGH
+            elif score >= thresholds.get("moderate", 40.0):
+                return InterestLevel.MODERATE
+            elif score >= thresholds.get("low", 20.0):
+                return InterestLevel.LOW
             else:
-                base_score -= 0.2
-
-        # リスク許容度による調整
-        base_score *= 0.5 + 0.5 * self.risk_tolerance
-
-        return min(1.0, max(0.0, base_score))
-
-    def _evaluate_risk(self, risks: List[str]) -> float:
-        """リスク面の評価を行う"""
-        base_score = 0.5
-        risk_count = len(risks)
-
-        # リスクの数による基本スコア調整
-        if risk_count == 0:
-            base_score += 0.3
-        elif risk_count <= 2:
-            base_score += 0.1
+                return InterestLevel.VERY_LOW
         else:
-            base_score -= 0.1 * risk_count
-
-        # リスク許容度による調整
-        risk_tolerance_factor = 0.5 + 0.5 * self.risk_tolerance
-        base_score *= risk_tolerance_factor
-
-        return min(1.0, max(0.0, base_score))
-
-    def _evaluate_benefits(self, benefits: List[str]) -> float:
-        """メリット面の評価を行う"""
-        base_score = 0.5
-        benefit_count = len(benefits)
-
-        # メリットの数による基本スコア調整
-        base_score += 0.1 * benefit_count
-
-        # 金融リテラシーによる調整
-        literacy_factor = 0.5 + 0.5 * self.financial_literacy
-        base_score *= literacy_factor
-
-        return min(1.0, max(0.0, base_score))
-
-    def _evaluate_feasibility(self, proposal: Proposal) -> float:
-        """実現可能性の評価を行う"""
-        base_score = 0.7  # 基本的に実現可能性は高めに設定
-
-        # 商品タイプに応じた調整
-        if proposal.product_type == ProductType.LOAN:
-            # ローンの場合、財務状況との整合性を確認
-            if "annual_sales" in proposal.terms:
-                sales_ratio = float(proposal.terms["annual_sales"]) / float(
-                    self.annual_sales
-                )
-                if sales_ratio > 0.5:  # 年商の50%を超える場合
-                    base_score -= 0.3
-                elif sales_ratio > 0.3:  # 年商の30%を超える場合
-                    base_score -= 0.1
-
-        return min(1.0, max(0.0, base_score))
-
-    def _evaluate_support(self, support_details: Dict[str, Any]) -> float:
-        """サポート体制の評価を行う"""
-        base_score = 0.5
-
-        # サポート内容の充実度による調整
-        if (
-            "dedicated_support" in support_details
-            and support_details["dedicated_support"]
-        ):
-            base_score += 0.2
-        if "online_support" in support_details and support_details["online_support"]:
-            base_score += 0.1
-        if "24h_support" in support_details and support_details["24h_support"]:
-            base_score += 0.1
-
-        return min(1.0, max(0.0, base_score))
-
-    def _evaluate_track_record(self, track_record: List[Dict[str, Any]]) -> float:
-        """実績の評価を行う"""
-        base_score = 0.5
-
-        if not track_record:
-            return base_score
-
-        # 実績数による調整
-        success_count = sum(
-            1 for record in track_record if record.get("success", False)
-        )
-        success_ratio = success_count / len(track_record)
-
-        base_score += 0.3 * success_ratio
-
-        # 同業種の実績による追加ボーナス
-        industry_matches = sum(
-            1 for record in track_record if record.get("industry") == self.industry
-        )
-        if industry_matches > 0:
-            base_score += 0.2
-
-        return min(1.0, max(0.0, base_score))
-
-    def _identify_remaining_concerns(self, proposal: Proposal) -> List[str]:
-        """未解決の懸念事項を特定"""
-        concerns = []
-
-        # コストに関する懸念
-        if self._evaluate_cost(proposal.cost_information) < 0.6:
-            concerns.append("コストが高い")
-
-        # リスクに関する懸念
-        if self._evaluate_risk(proposal.risks) < 0.6:
-            concerns.append("リスクが高い")
-
-        # 実現可能性に関する懸念
-        if self._evaluate_feasibility(proposal) < 0.6:
-            concerns.append("実現可能性に不安がある")
-
-        # サポート体制に関する懸念
-        if self._evaluate_support(proposal.support_details) < 0.6:
-            concerns.append("サポート体制が不十分")
-
-        # 実績に関する懸念
-        if self._evaluate_track_record(proposal.track_record) < 0.6:
-            concerns.append("実績が不十分")
-
-        return concerns
-
-    def _check_decision_criteria(self, proposal: Proposal) -> Dict[str, bool]:
-        """判断基準の充足状況を確認"""
-        criteria_met = {}
-
-        # 各評価基準のスコアを計算
-        scores = self._calculate_evaluation_scores(proposal)
-
-        # 基準の充足確認
-        for criteria in EvaluationCriteria:
-            criteria_met[criteria.value] = scores.get(criteria.value, 0.0) >= 0.7
-
-        return criteria_met
-
-    def _is_ready_for_decision(
-        self,
-        scores: Dict[str, float],
-        concerns: List[str],
-        criteria_met: Dict[str, bool],
-    ) -> bool:
-        """判断可能な状態かを確認"""
-        # 重要な判断基準が満たされているか確認
-        essential_criteria = [
-            EvaluationCriteria.COST.value,
-            EvaluationCriteria.RISK.value,
-            EvaluationCriteria.BENEFIT.value,
-        ]
-
-        if not all(
-            criteria_met.get(criteria, False) for criteria in essential_criteria
-        ):
-            return False
-
-        # 重大な懸念事項が残っていないか確認
-        if len(concerns) > 2:  # 3つ以上の懸念事項がある場合
-            return False
-
-        # 十分な情報が得られているか確認
-        min_score = min(scores.values())
-        if min_score < 0.4:  # いずれかの評価が著しく低い場合
-            return False
-
-        return True
-
-    def _make_final_decision(
-        self,
-        scores: Dict[str, float],
-        concerns: List[str],
-        criteria_met: Dict[str, bool],
-    ) -> str:
-        """最終判断を行う"""
-        # 平均スコアの計算
-        avg_score = sum(scores.values()) / len(scores)
-
-        # 判断基準の充足率
-        criteria_met_ratio = sum(1 for met in criteria_met.values() if met) / len(
-            criteria_met
-        )
-
-        # 懸念事項の重要度評価
-        concern_weight = len(concerns) * 0.1
-
-        # 最終スコアの計算
-        final_score = avg_score * (1 - concern_weight) * criteria_met_ratio
-
-        # 性格特性による調整
-        if CustomerPersonalityTrait.CAUTIOUS in self.personality_traits:
-            final_score *= 0.9
-        if CustomerPersonalityTrait.COOPERATIVE in self.personality_traits:
-            final_score *= 1.1
-
-        # 判断
-        if final_score >= 0.8:
-            decision = "success"
-        elif final_score <= 0.4:
-            decision = "failed"
-        else:
-            decision = "pending"
-
-        # 判断理由の記録
-        reason = f"最終評価スコア: {final_score:.2f}, "
-        reason += f"判断基準充足率: {criteria_met_ratio:.2f}, "
-        if concerns:
-            reason += f"残存する懸念事項: {', '.join(concerns)}"
-
-        self.decision_making.record_decision(decision, reason)
-
-        return decision
-
-    def _identify_required_information(self, proposal: Proposal) -> List[str]:
-        """追加で必要な情報を特定"""
-        required_info = []
-
-        # コスト情報の確認
-        if not proposal.cost_information.get("total_cost"):
-            required_info.append("総コストの詳細")
-        if not proposal.cost_information.get("payment_terms"):
-            required_info.append("支払条件の詳細")
-
-        # リスク情報の確認
-        if not proposal.risks:
-            required_info.append("リスク評価の詳細")
-
-        # サポート情報の確認
-        if not proposal.support_details:
-            required_info.append("サポート体制の詳細")
-
-        # 実績情報の確認
-        if not proposal.track_record:
-            required_info.append("導入実績の詳細")
-        elif not any(
-            record.get("industry") == self.industry for record in proposal.track_record
-        ):
-            required_info.append("同業種での導入実績")
-
-        return required_info
+            if score >= 80:
+                return InterestLevel.VERY_HIGH
+            elif score >= 60:
+                return InterestLevel.HIGH
+            elif score >= 40:
+                return InterestLevel.MODERATE
+            elif score >= 20:
+                return InterestLevel.LOW
+            else:
+                return InterestLevel.VERY_LOW
 
 
 class Assignment(BaseModel):

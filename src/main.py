@@ -71,7 +71,21 @@ def format_conversation_history(history):
     return formatted_history
 
 
+def setup_directory_structure():
+    """必要なディレクトリ構造を初期化"""
+    directories = [
+        "data",
+        "data/output",
+    ]
+    for directory in directories:
+        os.makedirs(directory, exist_ok=True)
+        print(f"Directory {directory} is ready.")
+
+
 def main():
+    # 初期セットアップ
+    setup_directory_structure()
+
     # サービスの初期化
     openai_client = OpenAIClient(DEFAULT_SIMULATION_CONFIG)
     simulation_service = SimulationService(

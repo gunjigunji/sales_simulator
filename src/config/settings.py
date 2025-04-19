@@ -14,7 +14,7 @@ class BankMetadata:
 class SimulationConfig:
     num_personas: int = 3
     num_visits: int = 3
-    num_turns_per_visit: int = 8  # 4往復（営業担当→企業担当のやり取りを4回）
+    num_turns_per_visit: int = 4  # 2往復（営業担当→企業担当のやり取りを2回）
     visit_interval_days: int = 1  # メール間隔（日数）
     model: str = "gpt-4.1-mini"
     temperature: float = 0.7

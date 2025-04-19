@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from pydantic import BaseModel, Field, ValidationError
 
+from src.models.evaluation import EvaluationResult
 from src.models.persona import (
     Assignment,
     CompanyPersona,
@@ -150,6 +151,152 @@ class SimulationService:
             session_history.append(SessionHistory(role="system", content=prev_summary))
 
         # 商談進捗の更新
+        self._update_negotiation_stage(company_persona, session_num)
+
+        # 初回と2回目以降でプロンプトを分岐
+        if session_num == 1:
+            initial_greeting_prompt = self._create_initial_greeting_prompt(
+                sales_persona, company_persona, current_visit_date
+            )
+        else:
+            initial_greeting_prompt = self._create_followup_greeting_prompt(
+                sales_persona, company_persona, current_visit_date, session_history
+            )
+
+        try:
+            initial_email = self._generate_email_message(
+                initial_greeting_prompt, sales_persona, company_persona
+            )
+
+            # 提案内容の評価と応答タイプの決定
+            evaluation_result = self._evaluate_proposal_and_determine_response(
+                company_persona, initial_email
+            )
+
+            session_history.append(
+                SessionHistory(
+                    role="assistant",
+                    content=initial_email.format_as_email(),
+                    product_type=initial_email.product_type,
+                    success_score=evaluation_result.scores.get(
+                        EvaluationCriteria.BENEFIT.value, 0.5
+                    ),
+                )
+            )
+
+            # 会話コンテキストの更新
+            self._update_conversation_context(
+                company_persona, initial_email, evaluation_result
+            )
+
+        except Exception as e:
+            print(f"Error generating initial email: {e}")
+            initial_email = self._create_default_email(
+                sales_persona, company_persona, session_num
+            )
+            session_history.append(
+                SessionHistory(
+                    role="assistant",
+                    content=initial_email.format_as_email(),
+                )
+            )
+
+        current_role = "customer"
+        attempts = 1
+        matched_products = []
+        current_status = SalesStatus.IN_PROGRESS
+
+        while (
+            attempts <= self.config.num_turns_per_visit
+            and current_status == SalesStatus.IN_PROGRESS
+        ):
+            if current_role == "sales":
+                try:
+                    sales_email = self._generate_sales_email(
+                        sales_persona, company_persona, session_history, attempts
+                    )
+
+                    evaluation_result = self._evaluate_proposal_and_determine_response(
+                        company_persona, sales_email
+                    )
+
+                    if evaluation_result.decision == "success":
+                        matched_products.append(sales_email.product_type)
+
+                    session_history.append(
+                        SessionHistory(
+                            role="assistant",
+                            content=sales_email.format_as_email(),
+                            product_type=sales_email.product_type,
+                            success_score=evaluation_result.scores.get(
+                                EvaluationCriteria.BENEFIT.value, 0.5
+                            ),
+                        )
+                    )
+
+                    self._update_conversation_context(
+                        company_persona, sales_email, evaluation_result
+                    )
+
+                except Exception as e:
+                    print(f"Error generating sales email: {e}")
+                    attempts += 1
+                    continue
+
+                current_role = "customer"
+            else:
+                try:
+                    customer_email = self._generate_customer_email(
+                        company_persona, sales_persona, session_history, attempts
+                    )
+
+                    session_history.append(
+                        SessionHistory(
+                            role="assistant",
+                            content=customer_email.format_as_email(),
+                        )
+                    )
+
+                except Exception as e:
+                    print(f"Error generating customer email: {e}")
+                    customer_email = self._create_default_customer_email(
+                        company_persona, sales_persona
+                    )
+                    session_history.append(
+                        SessionHistory(
+                            role="assistant",
+                            content=customer_email.format_as_email(),
+                        )
+                    )
+
+                current_role = "sales"
+                attempts += 1
+
+                # 応答タイプに基づいてステータスを更新
+                current_status = self._determine_current_status(
+                    company_persona, customer_email
+                )
+
+        # 最終的なステータスを判定
+        final_status = self._determine_final_status(
+            current_status, matched_products, company_persona
+        )
+
+        history_dicts = [h.to_dict() for h in session_history]
+
+        return SessionSummary(
+            session_num=session_num,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            visit_date=current_visit_date.strftime("%Y-%m-%d"),
+            history=history_dicts,
+            final_status=final_status,
+            matched_products=matched_products,
+        )
+
+    def _update_negotiation_stage(
+        self, company_persona: CompanyPersona, session_num: int
+    ) -> None:
+        """商談進捗のステージを更新"""
         if session_num == 1:
             company_persona.negotiation_progress.update_stage(NegotiationStage.INITIAL)
         elif company_persona.negotiation_progress.stage == NegotiationStage.INITIAL:
@@ -167,510 +314,107 @@ class SimulationService:
             elif (
                 company_persona.negotiation_progress.stage
                 == NegotiationStage.DETAILED_REVIEW
+                and company_persona.current_interest_score.score >= 80.0
             ):
                 company_persona.negotiation_progress.update_stage(
                     NegotiationStage.FINAL_EVALUATION
                 )
 
-        # 初回と2回目以降でプロンプトを分岐
-        if session_num == 1:
-            initial_greeting_prompt = f"""
-            以下の情報に基づいて、営業担当者として企業担当者に送る初回メールを生成してください。
-            メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
-
-            営業担当者情報：
-            - 名前：{sales_persona.name}
-            - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
-            - 経験年数：{sales_persona.experience_level.value}
-            - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
-
-            企業情報：
-            - 企業名：{company_persona.name}
-            - 業種：{company_persona.industry}
-            - 事業内容：{company_persona.business_description}
-            - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
-
-            企業担当者情報：
-            - 名前：{company_persona.contact_person.name}
-            - 役職：{company_persona.contact_person.position}
-            - 年齢：{company_persona.contact_person.age}
-            - 入社年数：{company_persona.contact_person.years_in_company}
-            - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
-            - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
-
-            商談段階：{company_persona.negotiation_progress.stage.value}
-            
-            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
-
-            初回のメールであることを考慮し、適切な挨拶と自己紹介を含めてください。
-            企業担当者の役職に応じた敬称（例：部長、課長など）を使用してください。
-            """
-        else:
-            # 前回のやり取りから商品提案の進捗状況を抽出
-            previous_products = []
-            previous_status = None
-            if session_history:
-                for history in session_history:
-                    if history.product_type:
-                        previous_products.append(history.product_type)
-                    if history.success_score is not None:
-                        previous_status = (
-                            "前向き"
-                            if history.success_score >= 0.7
-                            else "検討中"
-                            if history.success_score >= 0.4
-                            else "消極的"
-                        )
-
-            # 会話コンテキストから前回の約束や話題を取得
-            previous_actions = (
-                "、".join(company_persona.conversation_context.promised_actions[-3:])
-                if company_persona.conversation_context.promised_actions
-                else "特になし"
-            )
-            previous_topics = (
-                "、".join(company_persona.conversation_context.discussed_topics[-3:])
-                if company_persona.conversation_context.discussed_topics
-                else "特になし"
-            )
-
-            # 商談進捗情報を取得
-            current_stage = company_persona.negotiation_progress.stage.value
-            key_concerns = (
-                ", ".join(company_persona.negotiation_progress.key_concerns)
-                if company_persona.negotiation_progress.key_concerns
-                else "特になし"
-            )
-            required_info = (
-                ", ".join(company_persona.negotiation_progress.required_information)
-                if company_persona.negotiation_progress.required_information
-                else "特になし"
-            )
-
-            initial_greeting_prompt = f"""
-            以下の情報に基づいて、営業担当者として企業担当者に送るメールを生成してください。
-            メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
-
-            営業担当者情報：
-            - 名前：{sales_persona.name}
-            - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
-            - 経験年数：{sales_persona.experience_level.value}
-            - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
-
-            企業情報：
-            - 企業名：{company_persona.name}
-            - 業種：{company_persona.industry}
-            - 事業内容：{company_persona.business_description}
-            - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
-
-            企業担当者情報：
-            - 名前：{company_persona.contact_person.name}
-            - 役職：{company_persona.contact_person.position}
-            - 年齢：{company_persona.contact_person.age}
-            - 入社年数：{company_persona.contact_person.years_in_company}
-            - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
-            - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
-
-            商談進捗情報：
-            - 現在の段階：{current_stage}
-            - 主な懸念事項：{key_concerns}
-            - 必要な追加情報：{required_info}
-            - 前回の約束事項：{previous_actions}
-            - 前回の話題：{previous_topics}
-            - 提案商品の反応：{previous_status if previous_status else "不明"}
-
-            営業活動日：{current_visit_date.strftime("%Y年%m月%d日")}
-
-            前回のやり取りを踏まえて、適切なフォローアップと新たな提案を行ってください。
-            前回の提案に対する企業様の反応を考慮し、必要に応じて提案内容を調整してください。
-            企業担当者の役職に応じた敬称（例：部長、課長など）を使用してください。
-            """
-
-        try:
-            initial_email = self.openai_client.call_structured_api(
-                [{"role": "user", "content": initial_greeting_prompt}],
-                response_model=EmailMessage,
-                temperature=0.3,
-            )
-            initial_email.sender = sales_persona.name
-            initial_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
-
-            # 提案内容の構造化
-            proposal = Proposal(
-                product_type=initial_email.product_type or ProductType.OTHER,
-                terms={},
-                benefits=[],
-                risks=[],
-                cost_information={},
-                support_details={},
-                track_record=[],
-            )
-
-            # 提案内容の評価
-            evaluation = company_persona.evaluate_proposal(proposal)
-
-            # 評価結果に基づく応答タイプの決定
-            if evaluation.decision == "success":
-                response_type = ResponseType.ACCEPTANCE
-            elif evaluation.decision == "failed":
-                response_type = ResponseType.REJECTION
-            else:
-                response_type = company_persona.determine_response_type(
-                    company_persona.current_interest_score, config=self.config
-                )
-
-            session_history.append(
-                SessionHistory(
-                    role="assistant",
-                    content=initial_email.format_as_email(),
-                    product_type=initial_email.product_type,
-                    success_score=evaluation.scores.get(
-                        EvaluationCriteria.BENEFIT.value, 0.5
-                    ),
-                )
-            )
-
-            # 提案内容の分析と会話コンテキストの更新
-            if initial_email.product_type:
-                company_persona.conversation_context.add_product_discussion(
-                    initial_email.product_type
-                )
-
-            # メール内容から話題を抽出
-            topics = ["ご挨拶", "自己紹介"] if session_num == 1 else []
-            if "ご提案" in initial_email.body:
-                topics.append("商品提案")
-            if "資料" in initial_email.body:
-                topics.append("資料送付")
-            for topic in topics:
-                company_persona.conversation_context.add_topic(topic)
-
-            # 約束事項の抽出
-            if "ご検討" in initial_email.body:
-                company_persona.conversation_context.add_action("商品内容の検討")
-            if "ご連絡" in initial_email.body:
-                company_persona.conversation_context.add_action("追加連絡")
-
-            # 評価結果に基づく懸念事項の更新
-            for concern in evaluation.concerns:
-                company_persona.negotiation_progress.add_concern(concern)
-
-            # 必要な追加情報の更新
-            if evaluation.required_info:
-                company_persona.negotiation_progress.required_information = (
-                    evaluation.required_info
-                )
-
-        except Exception as e:
-            print(f"Error generating initial email: {e}")
-            # エラー時はデフォルトのメールを使用
-            if session_num == 1:
-                default_email = EmailMessage(
-                    subject="ご挨拶と今後のご提案について",
-                    body=f"""
-                    {company_persona.contact_person.name} {company_persona.contact_person.position} 様
-
-                    平素より大変お世話になっております。
-                    {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}と申します。
-
-                    この度は貴社のご発展を心よりお慶び申し上げます。
-                    つきましては、貴社のご要望に沿った金融商品のご提案をさせていただきたく、
-                    ご連絡させていただきました。
-
-                    貴社のご要望やご質問がございましたら、メールにて承りますので、
-                    お気軽にご連絡ください。
-
-                    何卒よろしくお願い申し上げます。
-                    """,
-                    sender=sales_persona.name,
-                    recipient=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
-                )
-            else:
-                default_email = EmailMessage(
-                    subject="前回のご提案についてのフォローアップ",
-                    body=f"""
-                    {company_persona.contact_person.name} {company_persona.contact_person.position} 様
-
-                    平素より大変お世話になっております。
-                    {self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}でございます。
-
-                    前回のご提案について、ご検討いただきありがとうございます。
-                    この度は、前回のご提案内容を踏まえまして、より具体的なご提案をさせていただきたく、
-                    ご連絡させていただきました。
-
-                    ご質問やご要望がございましたら、メールにて承りますので、
-                    お気軽にご連絡ください。
-
-                    何卒よろしくお願い申し上げます。
-                    """,
-                    sender=sales_persona.name,
-                    recipient=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
-                )
-            session_history.append(
-                SessionHistory(
-                    role="assistant",
-                    content=default_email.format_as_email(),
-                )
-            )
-
-        current_role = "customer"
-        attempts = 1  # 初回メールを1回目としてカウント
-        matched_products = []
-        current_status = SalesStatus.IN_PROGRESS
-
-        while (
-            attempts <= self.config.num_turns_per_visit  # 初回メールを含めた合計回数
-            and current_status == SalesStatus.IN_PROGRESS
-        ):
-            if current_role == "sales":
-                # 営業担当者からのメールを生成
-                sales_email_prompt = f"""
-                以下の会話履歴に基づいて、営業担当者として企業担当者に送るメールを生成してください。
-                メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
-
-                営業担当者情報：
-                - 名前：{sales_persona.name}
-                - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
-                - 経験年数：{sales_persona.experience_level.value}
-                - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
-
-                企業情報：
-                - 企業名：{company_persona.name}
-                - 業種：{company_persona.industry}
-                - 事業内容：{company_persona.business_description}
-                - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
-
-                企業担当者情報：
-                - 名前：{company_persona.contact_person.name}
-                - 役職：{company_persona.contact_person.position}
-                - 年齢：{company_persona.contact_person.age}
-                - 入社年数：{company_persona.contact_person.years_in_company}
-                - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
-                - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
-
-                商談進捗情報：
-                - 現在の段階：{company_persona.negotiation_progress.stage.value}
-                - 主な懸念事項：{", ".join(company_persona.negotiation_progress.key_concerns) if company_persona.negotiation_progress.key_concerns else "特になし"}
-                - 必要な追加情報：{", ".join(company_persona.negotiation_progress.required_information) if company_persona.negotiation_progress.required_information else "特になし"}
-
-                会話履歴：
-                {[h.content for h in session_history]}
-
-                前回の企業様の反応：
-                - 興味レベル：{company_persona.current_interest_score.level.value if company_persona.current_interest_score else "不明"}
-                - 応答タイプ：{company_persona.response_history[-1].value if company_persona.response_history else "不明"}
-                """
-
-                try:
-                    sales_email = self.openai_client.call_structured_api(
-                        [{"role": "user", "content": sales_email_prompt}],
-                        response_model=EmailMessage,
-                        temperature=0.3,
-                    )
-                    sales_email.sender = sales_persona.name
-                    sales_email.recipient = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
-
-                    # 提案内容の構造化と評価
-                    proposal = Proposal(
-                        product_type=sales_email.product_type or ProductType.OTHER,
-                        terms={},
-                        benefits=[],
-                        risks=[],
-                        cost_information={},
-                        support_details={},
-                        track_record=[],
-                    )
-
-                    evaluation = company_persona.evaluate_proposal(proposal)
-
-                    # 成功した提案は記録
-                    if evaluation.decision == "success":
-                        matched_products.append(sales_email.product_type)
-
-                    session_history.append(
-                        SessionHistory(
-                            role="assistant",
-                            content=sales_email.format_as_email(),
-                            product_type=sales_email.product_type,
-                            success_score=evaluation.scores.get(
-                                EvaluationCriteria.BENEFIT.value, 0.5
-                            ),
-                        )
-                    )
-
-                    # 提案内容の分析と会話コンテキストの更新
-                    if sales_email.product_type:
-                        company_persona.conversation_context.add_product_discussion(
-                            sales_email.product_type
-                        )
-
-                    # メール内容から話題を抽出
-                    topics = []
-                    if "ご提案" in sales_email.body:
-                        topics.append("商品提案")
-                    if "資料" in sales_email.body:
-                        topics.append("資料送付")
-                    if "シミュレーション" in sales_email.body:
-                        topics.append("シミュレーション")
-                    for topic in topics:
-                        company_persona.conversation_context.add_topic(topic)
-
-                    # 約束事項の抽出
-                    if "ご検討" in sales_email.body:
-                        company_persona.conversation_context.add_action(
-                            "商品内容の検討"
-                        )
-                    if "ご連絡" in sales_email.body:
-                        company_persona.conversation_context.add_action("追加連絡")
-
-                    # 評価結果に基づく懸念事項の更新
-                    for concern in evaluation.concerns:
-                        company_persona.negotiation_progress.add_concern(concern)
-
-                    # 必要な追加情報の更新
-                    if evaluation.required_info:
-                        company_persona.negotiation_progress.required_information = (
-                            evaluation.required_info
-                        )
-
-                    attempts += 1
-
-                except Exception as e:
-                    print(f"Error generating sales email: {e}")
-                    attempts += 1
-
-                current_role = "customer"
-            else:
-                # 企業担当者からのメールを生成
-                # 直前の応答タイプに基づいて、適切な返信を生成
-                response_type = (
-                    company_persona.response_history[-1]
-                    if company_persona.response_history
-                    else ResponseType.NEUTRAL
-                )
-
-                if response_type == ResponseType.REJECTION:
-                    rejection_reason = company_persona.select_rejection_reason()
-                    rejection_context = f"拒否理由: {rejection_reason.value}"
-                else:
-                    rejection_context = ""
-
-                customer_email_prompt = f"""
-                以下の情報に基づいて、企業担当者として営業担当者に送るメールを生成してください。
-                メールは必ず指定されたJSONスキーマに準拠した形式で返してください。
-
-                企業情報：
-                - 企業名：{company_persona.name}
-                - 業種：{company_persona.industry}
-                - 事業内容：{company_persona.business_description}
-                - 担当者特性：{", ".join([t.value for t in company_persona.personality_traits])}
-                - 意思決定スタイル：{company_persona.decision_making_style}
-                - リスク許容度：{company_persona.risk_tolerance}
-                - 金融リテラシー：{company_persona.financial_literacy}
-
-                企業担当者情報：
-                - 名前：{company_persona.contact_person.name}
-                - 役職：{company_persona.contact_person.position}
-                - 年齢：{company_persona.contact_person.age}
-                - 入社年数：{company_persona.contact_person.years_in_company}
-                - 性格特性：{", ".join([t.value for t in company_persona.contact_person.personality_traits])}
-                - コミュニケーションスタイル：{company_persona.contact_person.communication_style}
-                - 意思決定スタイル：{company_persona.contact_person.decision_making_style}
-                - リスク許容度：{company_persona.contact_person.risk_tolerance}
-                - 金融リテラシー：{company_persona.contact_person.financial_literacy}
-                - ストレス耐性：{company_persona.contact_person.stress_tolerance}
-                - 適応力：{company_persona.contact_person.adaptability}
-
-                営業担当者情報：
-                - 名前：{sales_persona.name}
-                - 所属：{self.bank_metadata.bank_name} {self.bank_metadata.branch}
-                - 経験年数：{sales_persona.experience_level.value}
-                - 性格特性：{", ".join([t.value for t in sales_persona.personality_traits])}
-
-                商談進捗情報：
-                - 現在の段階：{company_persona.negotiation_progress.stage.value}
-                - 主な懸念事項：{", ".join(company_persona.negotiation_progress.key_concerns) if company_persona.negotiation_progress.key_concerns else "特になし"}
-                - 必要な追加情報：{", ".join(company_persona.negotiation_progress.required_information) if company_persona.negotiation_progress.required_information else "特になし"}
-
-                現在の状況：
-                - 応答タイプ：{response_type.value}
-                - 興味レベル：{company_persona.current_interest_score.level.value if company_persona.current_interest_score else "不明"}
-                {rejection_context}
-
-                会話履歴：
-                {[h.content for h in session_history]}
-
-                前回のやり取りを踏まえて、適切な返信を行ってください。
-                営業担当者の提案に対する反応は、あなたの性格特性、意思決定スタイル、リスク許容度、金融リテラシーを反映してください。
-                すべてのやり取りはメールのみで完結させ、訪問や面談に関する言及は避けてください。
-                メールでの質問や要望は十分に詳細に行ってください。
-                あなたの役職に応じた適切な敬称（例：様）を使用してください。
-                """
-
-                try:
-                    customer_email = self.openai_client.call_structured_api(
-                        [{"role": "user", "content": customer_email_prompt}],
-                        response_model=EmailMessage,
-                        temperature=0.3,
-                    )
-                    customer_email.sender = f"{company_persona.contact_person.name} {company_persona.contact_person.position}"
-                    customer_email.recipient = sales_persona.name
-
-                    session_history.append(
-                        SessionHistory(
-                            role="assistant",
-                            content=customer_email.format_as_email(),
-                        )
-                    )
-                    attempts += 1
-
-                except Exception as e:
-                    print(f"Error generating customer email: {e}")
-                    # エラー時はデフォルトのメールを使用
-                    default_customer_email = EmailMessage(
-                        subject="ご提案について",
-                        body=f"""
-                        {sales_persona.name} 様
-
-                        ご連絡ありがとうございます。
-                        ご提案いただいた内容について、社内で検討させていただきます。
-
-                        何卒よろしくお願い申し上げます。
-                        """,
-                        sender=f"{company_persona.contact_person.name} {company_persona.contact_person.position}",
-                        recipient=sales_persona.name,
-                    )
-                    session_history.append(
-                        SessionHistory(
-                            role="assistant",
-                            content=default_customer_email.format_as_email(),
-                        )
-                    )
-                    attempts += 1
-
-                current_role = "sales"
-
-                # 応答タイプに基づいてステータスを更新
-                if response_type == ResponseType.ACCEPTANCE:
-                    current_status = SalesStatus.SUCCESS
-                elif response_type == ResponseType.REJECTION:
-                    current_status = SalesStatus.FAILED
-                elif attempts >= self.config.num_turns_per_visit:
-                    current_status = SalesStatus.PENDING
-
-        # 会話終了後に最終的なステータスを判定
-        final_status = current_status
-
-        history_dicts = [h.to_dict() for h in session_history]
-
-        return SessionSummary(
-            session_num=session_num,
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            visit_date=current_visit_date.strftime("%Y-%m-%d"),
-            history=history_dicts,
-            final_status=final_status,
-            matched_products=matched_products,
+    def _evaluate_proposal_and_determine_response(
+        self, company_persona: CompanyPersona, email: EmailMessage
+    ) -> EvaluationResult:
+        """提案を評価し応答タイプを決定"""
+        proposal = Proposal(
+            product_type=email.product_type or ProductType.OTHER,
+            terms={},
+            benefits=[],
+            risks=[],
+            cost_information={},
+            support_details={},
+            track_record=[],
         )
+
+        evaluation = company_persona.evaluate_proposal(proposal)
+
+        # 興味度スコアの更新
+        interest_score = company_persona.calculate_interest_score(
+            email.body, email.product_type
+        )
+        company_persona.current_interest_score = interest_score
+        company_persona.conversation_context.interest_history.append(interest_score)
+
+        return evaluation
+
+    def _update_conversation_context(
+        self,
+        company_persona: CompanyPersona,
+        email: EmailMessage,
+        evaluation: EvaluationResult,
+    ) -> None:
+        """会話コンテキストを更新"""
+        if email.product_type:
+            company_persona.conversation_context.add_product_discussion(
+                email.product_type
+            )
+
+        # メール内容から話題を抽出して追加
+        topics = self._extract_topics_from_email(email)
+        for topic in topics:
+            company_persona.conversation_context.add_topic(topic)
+
+        # 約束事項を抽出して追加
+        actions = self._extract_actions_from_email(email)
+        for action in actions:
+            company_persona.conversation_context.add_action(action)
+
+        # 評価結果に基づく懸念事項の更新
+        for concern in evaluation.concerns:
+            company_persona.negotiation_progress.add_concern(concern)
+
+        # 必要な追加情報の更新
+        if evaluation.required_info:
+            company_persona.negotiation_progress.required_information = (
+                evaluation.required_info
+            )
+
+    def _determine_current_status(
+        self, company_persona: CompanyPersona, email: EmailMessage
+    ) -> SalesStatus:
+        """現在のステータスを判定"""
+        response_type = company_persona.determine_response_type(
+            company_persona.current_interest_score
+        )
+
+        if response_type == ResponseType.ACCEPTANCE:
+            return SalesStatus.SUCCESS
+        elif response_type == ResponseType.REJECTION:
+            return SalesStatus.FAILED
+        else:
+            return SalesStatus.IN_PROGRESS
+
+    def _determine_final_status(
+        self,
+        current_status: SalesStatus,
+        matched_products: List[ProductType],
+        company_persona: CompanyPersona,
+    ) -> SalesStatus:
+        """最終的なステータスを判定"""
+        # 商品がマッチしていない場合は成功としない
+        if not matched_products:
+            if (
+                current_status == SalesStatus.FAILED
+                or company_persona.current_interest_score.score < 20.0
+            ):
+                return SalesStatus.FAILED
+            return SalesStatus.PENDING
+
+        # 商品がマッチしている場合
+        if current_status == SalesStatus.SUCCESS and matched_products:
+            return SalesStatus.SUCCESS
+        elif current_status == SalesStatus.FAILED:
+            return SalesStatus.FAILED
+        else:
+            return SalesStatus.PENDING
 
     def record_bank_meeting_log(
         self,
@@ -796,3 +540,514 @@ class SimulationService:
             final_status=final_status,
             matched_products=progress.matched_products,
         )
+
+    def _create_initial_greeting_prompt(
+        self,
+        sales_persona: SalesPersona,
+        company_persona: CompanyPersona,
+        visit_date: datetime,
+    ) -> str:
+        """初回訪問時のプロンプトを作成"""
+        return f"""
+        あなたは以下の特性を持つ銀行の営業担当者として、初回のメールを作成してください：
+
+        営業担当者情報：
+        - 名前：{sales_persona.name}
+        - 経験：{sales_persona.experience_level.value}
+        - 性格：{", ".join([trait.value for trait in sales_persona.personality_traits])}
+        - 得意分野：{", ".join(sales_persona.specialties)}
+
+        企業情報：
+        - 企業名：{company_persona.name}
+        - 業種：{company_persona.industry}
+        - 事業内容：{company_persona.business_description}
+        - 資金ニーズ：{company_persona.financial_needs}
+        
+        企業担当者情報：
+        - 名前：{company_persona.contact_person.name if company_persona.contact_person else "不明"}
+        - 役職：{company_persona.contact_person.position if company_persona.contact_person else "不明"}
+
+        以下の点に注意してメールを作成してください：
+        1. 初回訪問であることを意識した内容にする
+        2. 企業の事業内容や資金ニーズに言及する
+        3. 具体的な商品提案は控えめにし、まずは関係構築を重視する
+        4. 企業担当者の性格特性に合わせたトーンで書く
+        5. メールは必ず以下の形式で記載する：
+
+        件名: [ここに件名]
+        送信者: {sales_persona.name}
+        受信者: {company_persona.contact_person.name if company_persona.contact_person else "ご担当者様"}
+        日時: {visit_date.strftime("%Y-%m-%d %H:%M:%S")}
+
+        [ここに本文]
+        """
+
+    def _create_followup_greeting_prompt(
+        self,
+        sales_persona: SalesPersona,
+        company_persona: CompanyPersona,
+        visit_date: datetime,
+        session_history: List[SessionHistory],
+    ) -> str:
+        """フォローアップ訪問時のプロンプトを作成"""
+        # 直近の会話履歴を取得
+        recent_history = "\n".join(
+            [
+                f"{h.role}: {h.content}"
+                for h in session_history[-3:]
+                if h.role != "system"
+            ]
+        )
+
+        # 商談進捗状況
+        negotiation_stage = company_persona.negotiation_progress.stage.value
+        key_concerns = (
+            ", ".join(company_persona.negotiation_progress.key_concerns) or "特になし"
+        )
+        required_info = (
+            ", ".join(company_persona.negotiation_progress.required_information)
+            or "特になし"
+        )
+
+        return f"""
+        あなたは以下の特性を持つ銀行の営業担当者として、フォローアップのメールを作成してください：
+
+        営業担当者情報：
+        - 名前：{sales_persona.name}
+        - 経験：{sales_persona.experience_level.value}
+        - 性格：{", ".join([trait.value for trait in sales_persona.personality_traits])}
+        - 得意分野：{", ".join(sales_persona.specialties)}
+
+        企業情報：
+        - 企業名：{company_persona.name}
+        - 業種：{company_persona.industry}
+        - 資金ニーズ：{company_persona.financial_needs}
+        
+        商談状況：
+        - 商談ステージ：{negotiation_stage}
+        - 主な懸念事項：{key_concerns}
+        - 必要な追加情報：{required_info}
+        - 現在の興味度：{company_persona.current_interest_score.score:.1f}
+
+        直近の会話履歴：
+        {recent_history}
+
+        以下の点に注意してメールを作成してください：
+        1. 前回までの会話内容を踏まえた内容にする
+        2. 商談ステージに応じた適切な提案や質問を行う
+        3. 懸念事項や必要な情報に関する確認を含める
+        4. 企業担当者の反応に基づいて提案内容を調整する
+        5. メールは必ず以下の形式で記載する：
+
+        件名: [ここに件名]
+        送信者: {sales_persona.name}
+        受信者: {company_persona.contact_person.name if company_persona.contact_person else "ご担当者様"}
+        日時: {visit_date.strftime("%Y-%m-%d %H:%M:%S")}
+
+        [ここに本文]
+        """
+
+    def _generate_email_message(
+        self,
+        prompt: str,
+        sales_persona: SalesPersona,
+        company_persona: CompanyPersona,
+    ) -> EmailMessage:
+        """プロンプトに基づいてメールメッセージを生成"""
+        try:
+            messages = [
+                {"role": "system", "content": self.prompts.system_prompt_sales_bank},
+                {"role": "user", "content": prompt},
+            ]
+
+            response = self.openai_client.call_chat_api(messages)
+
+            # メール形式の応答をパース
+            lines = response.strip().split("\n")
+            subject = ""
+            sender = ""
+            recipient = ""
+            date = ""
+            body = []
+            header_section = True
+
+            for line in lines:
+                line = line.strip()
+                if not line and header_section:
+                    header_section = False
+                    continue
+
+                if header_section:
+                    if line.startswith("件名:"):
+                        subject = line.replace("件名:", "").strip()
+                    elif line.startswith("送信者:"):
+                        sender = line.replace("送信者:", "").strip()
+                    elif line.startswith("受信者:"):
+                        recipient = line.replace("受信者:", "").strip()
+                    elif line.startswith("日時:"):
+                        date = line.replace("日時:", "").strip()
+                else:
+                    body.append(line)
+
+            return EmailMessage(
+                subject=subject,
+                body="\n".join(body),
+                sender=sender,
+                recipient=recipient,
+                date=date,
+            )
+
+        except Exception as e:
+            print(f"Error generating email message: {e}")
+            return self._create_default_email(sales_persona, company_persona)
+
+    def _create_default_email(
+        self,
+        sales_persona: SalesPersona,
+        company_persona: CompanyPersona,
+        session_num: int = 1,
+    ) -> EmailMessage:
+        """デフォルトのメールメッセージを作成"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if session_num == 1:
+            subject = (
+                f"初回のご挨拶 - {sales_persona.name}（{self.bank_metadata.bank_name}）"
+            )
+            body = f"""
+{company_persona.contact_person.name if company_persona.contact_person else "ご担当者様"}
+
+{self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}でございます。
+
+この度は、お客様の事業についてお話をさせていただく機会をいただき、誠にありがとうございます。
+弊行では、お客様の事業発展のお手伝いができればと考えております。
+
+お客様のご要望やご不明な点などございましたら、お気軽にご相談いただけますと幸いです。
+
+今後ともよろしくお願い申し上げます。
+
+{sales_persona.name}
+{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+"""
+        else:
+            subject = f"ご提案のご相談 - {sales_persona.name}（{self.bank_metadata.bank_name}）"
+            body = f"""
+{company_persona.contact_person.name if company_persona.contact_person else "ご担当者様"}
+
+{self.bank_metadata.bank_name} {self.bank_metadata.branch}の{sales_persona.name}でございます。
+
+前回のご連絡に引き続き、お客様のニーズに合わせた提案をさせていただければと存じます。
+
+ご多忙のところ恐縮ではございますが、ご検討いただけますと幸いです。
+
+今後ともよろしくお願い申し上げます。
+
+{sales_persona.name}
+{self.bank_metadata.bank_name} {self.bank_metadata.branch}
+"""
+
+        return EmailMessage(
+            subject=subject,
+            body=body,
+            sender=sales_persona.name,
+            recipient=company_persona.contact_person.name
+            if company_persona.contact_person
+            else "ご担当者様",
+            date=current_time,
+        )
+
+    def _generate_customer_email(
+        self,
+        company_persona: CompanyPersona,
+        sales_persona: SalesPersona,
+        session_history: List[SessionHistory],
+        attempts: int,
+    ) -> EmailMessage:
+        """企業担当者からのメールを生成"""
+        try:
+            # 直近の会話履歴を取得
+            recent_history = "\n".join(
+                [
+                    f"{h.role}: {h.content}"
+                    for h in session_history[-3:]
+                    if h.role != "system"
+                ]
+            )
+
+            prompt = f"""
+企業情報：
+- 企業名：{company_persona.name}
+- 業種：{company_persona.industry}
+- 事業内容：{company_persona.business_description}
+- 資金ニーズ：{company_persona.financial_needs}
+
+企業担当者情報：
+- 名前：{company_persona.contact_person.name if company_persona.contact_person else "不明"}
+- 役職：{company_persona.contact_person.position if company_persona.contact_person else "不明"}
+- 性格：{", ".join([trait.value for trait in company_persona.personality_traits])}
+- 意思決定スタイル：{company_persona.decision_making_style}
+
+直近の会話履歴：
+{recent_history}
+
+以下の点に注意してメールを作成してください：
+1. 企業担当者の立場から返信を作成
+2. 性格特性と意思決定スタイルを反映
+3. 企業の状況やニーズを踏まえた内容
+4. メールは必ず以下の形式で記載：
+
+件名: [ここに件名]
+送信者: {company_persona.contact_person.name if company_persona.contact_person else "ご担当者"}
+受信者: {sales_persona.name}
+日時: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+[ここに本文]
+"""
+
+            messages = [
+                {"role": "system", "content": self.prompts.system_prompt_customer_bank},
+                {"role": "user", "content": prompt},
+            ]
+
+            response = self.openai_client.call_chat_api(messages)
+
+            # メール形式の応答をパース
+            lines = response.strip().split("\n")
+            subject = ""
+            sender = ""
+            recipient = ""
+            date = ""
+            body = []
+            header_section = True
+
+            for line in lines:
+                line = line.strip()
+                if not line and header_section:
+                    header_section = False
+                    continue
+
+                if header_section:
+                    if line.startswith("件名:"):
+                        subject = line.replace("件名:", "").strip()
+                    elif line.startswith("送信者:"):
+                        sender = line.replace("送信者:", "").strip()
+                    elif line.startswith("受信者:"):
+                        recipient = line.replace("受信者:", "").strip()
+                    elif line.startswith("日時:"):
+                        date = line.replace("日時:", "").strip()
+                else:
+                    body.append(line)
+
+            return EmailMessage(
+                subject=subject,
+                body="\n".join(body),
+                sender=sender,
+                recipient=recipient,
+                date=date,
+            )
+
+        except Exception as e:
+            print(f"Error generating customer email: {e}")
+            return self._create_default_customer_email(company_persona, sales_persona)
+
+    def _create_default_customer_email(
+        self,
+        company_persona: CompanyPersona,
+        sales_persona: SalesPersona,
+    ) -> EmailMessage:
+        """デフォルトの企業担当者からのメールを作成"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        subject = f"Re: ご提案について"
+        body = f"""
+{sales_persona.name}様
+
+お世話になっております。
+{company_persona.name}の{company_persona.contact_person.name if company_persona.contact_person else "担当者"}でございます。
+
+ご提案ありがとうございます。
+内容を確認させていただき、検討させていただきます。
+
+何かございましたら、改めてご連絡させていただきます。
+
+よろしくお願いいたします。
+
+{company_persona.contact_person.name if company_persona.contact_person else "担当者"}
+{company_persona.name}
+"""
+
+        return EmailMessage(
+            subject=subject,
+            body=body,
+            sender=company_persona.contact_person.name
+            if company_persona.contact_person
+            else "担当者",
+            recipient=sales_persona.name,
+            date=current_time,
+        )
+
+    def _generate_sales_email(
+        self,
+        sales_persona: SalesPersona,
+        company_persona: CompanyPersona,
+        session_history: List[SessionHistory],
+        attempts: int,
+    ) -> EmailMessage:
+        """営業担当者からのメールを生成"""
+        try:
+            # 直近の会話履歴を取得
+            recent_history = "\n".join(
+                [
+                    f"{h.role}: {h.content}"
+                    for h in session_history[-3:]
+                    if h.role != "system"
+                ]
+            )
+
+            prompt = f"""
+営業担当者情報：
+- 名前：{sales_persona.name}
+- 経験：{sales_persona.experience_level.value}
+- 性格：{", ".join([trait.value for trait in sales_persona.personality_traits])}
+- 得意分野：{", ".join(sales_persona.specialties)}
+
+企業情報：
+- 企業名：{company_persona.name}
+- 業種：{company_persona.industry}
+- 資金ニーズ：{company_persona.financial_needs}
+
+直近の会話履歴：
+{recent_history}
+
+以下の点に注意してメールを作成してください：
+1. 営業担当者の経験と性格特性を反映
+2. 企業の状況やニーズに合わせた提案
+3. 前回までの会話を踏まえた内容
+4. メールは必ず以下の形式で記載：
+
+件名: [ここに件名]
+送信者: {sales_persona.name}
+受信者: {company_persona.contact_person.name if company_persona.contact_person else "ご担当者様"}
+日時: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+[ここに本文]
+"""
+
+            messages = [
+                {"role": "system", "content": self.prompts.system_prompt_sales_bank},
+                {"role": "user", "content": prompt},
+            ]
+
+            response = self.openai_client.call_chat_api(messages)
+
+            # メール形式の応答をパース
+            lines = response.strip().split("\n")
+            subject = ""
+            sender = ""
+            recipient = ""
+            date = ""
+            body = []
+            header_section = True
+
+            for line in lines:
+                line = line.strip()
+                if not line and header_section:
+                    header_section = False
+                    continue
+
+                if header_section:
+                    if line.startswith("件名:"):
+                        subject = line.replace("件名:", "").strip()
+                    elif line.startswith("送信者:"):
+                        sender = line.replace("送信者:", "").strip()
+                    elif line.startswith("受信者:"):
+                        recipient = line.replace("受信者:", "").strip()
+                    elif line.startswith("日時:"):
+                        date = line.replace("日時:", "").strip()
+                else:
+                    body.append(line)
+
+            return EmailMessage(
+                subject=subject,
+                body="\n".join(body),
+                sender=sender,
+                recipient=recipient,
+                date=date,
+            )
+
+        except Exception as e:
+            print(f"Error generating sales email: {e}")
+            return self._create_default_email(sales_persona, company_persona)
+
+    def _extract_topics_from_email(self, email: EmailMessage) -> List[str]:
+        """メール内容から話題を抽出"""
+        try:
+            prompt = f"""
+            以下のメール内容から主要な話題を抽出してください。
+            箇条書きで3つまで抽出してください。
+
+            メール内容：
+            {email.body}
+            """
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "あなたはメール内容から主要な話題を抽出する専門家です。",
+                },
+                {"role": "user", "content": prompt},
+            ]
+
+            response = self.openai_client.call_chat_api(
+                messages, temperature=0.3, max_tokens=200
+            )
+
+            # 箇条書きの応答を行ごとに分割し、先頭の記号を削除
+            topics = [
+                line.strip().lstrip("・-*").strip()
+                for line in response.split("\n")
+                if line.strip() and any(c.isalnum() for c in line)
+            ]
+
+            return topics[:3]  # 最大3つまでの話題を返す
+
+        except Exception as e:
+            print(f"Error extracting topics from email: {e}")
+            return []
+
+    def _extract_actions_from_email(self, email: EmailMessage) -> List[str]:
+        """メール内容から約束事項を抽出"""
+        try:
+            prompt = f"""
+            以下のメール内容から約束事項や次のアクションを抽出してください。
+            箇条書きで3つまで抽出してください。
+            期限や具体的な行動が含まれているものを優先してください。
+
+            メール内容：
+            {email.body}
+            """
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "あなたはメール内容から約束事項やアクションアイテムを抽出する専門家です。",
+                },
+                {"role": "user", "content": prompt},
+            ]
+
+            response = self.openai_client.call_chat_api(
+                messages, temperature=0.3, max_tokens=200
+            )
+
+            # 箇条書きの応答を行ごとに分割し、先頭の記号を削除
+            actions = [
+                line.strip().lstrip("・-*").strip()
+                for line in response.split("\n")
+                if line.strip() and any(c.isalnum() for c in line)
+            ]
+
+            return actions[:3]  # 最大3つまでのアクションを返す
+
+        except Exception as e:
+            print(f"Error extracting actions from email: {e}")
+            return []
